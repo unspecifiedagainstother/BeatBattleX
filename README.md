@@ -5,15 +5,17 @@ A extention to improve beat-battle.net
 
 <img width="448" height="819" alt="image" src="https://github.com/user-attachments/assets/fd95214c-0a03-43e3-b742-379d717ca699" />
 <img width="368" height="697" alt="image" src="https://github.com/user-attachments/assets/265b9242-28df-4e04-8ccd-7f905e104d34" />
+<img width="758" height="250" alt="image" src="https://github.com/user-attachments/assets/fed7de1f-4f1e-44d4-a7f1-82b37ffbd266" />
 
 ---
 
 ## Features
+- **Anonymous Reveal**: Reveal anonymous users, and anonymous "Entry 1" uploads.
 - **Uploads**: filename, MIME type, size, duration, downloadable vs stream-only, playback link,
-  average rating, and a `dupe (same sha256)` warning when two players submit the same file.
+  average rating, and a `dupe (same sha256)` warning when two players submit the same file with alt detection.
 - **Members**: ready state, Discord ID (read from the avatar URL) or Google-auth marker, how many
   kick votes each player has started, forfeits.
-- **Joined / left members** and **kick history** — persisted per room in `localStorage`, so they
+- **Joined / left members** and **kick history**, persisted per room in `localStorage`, so they
   survive a reload.
 - **Chat**: mirrored log with avatars, plus `copy chat log`.
 - **Known users**: a cross-room directory of everyone you've seen, with CSV import/export.

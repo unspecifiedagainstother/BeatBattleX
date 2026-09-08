@@ -35,7 +35,7 @@ Pick one for your browser:
 ### 2(b). Install the scripts
 Click a link below with the manager installed, it opens the install prompt directly:
 
-[`Click Here`](https://raw.githubusercontent.com/FaithfullyOSS/BeatBattleX/main/beatbattle-overlay.user.js)
+[`Click Here`](https://raw.githubusercontent.com/FaithfullyOSS/BeatBattleX/main/beatbattlex.user.js)
 
 Hit **Install** on the prompt, then open [beat-battle.net](https://beat-battle.net) and join a room.
 

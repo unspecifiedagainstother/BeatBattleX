@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BeatBattleX
 // @namespace    beatbattlex
-// @version      1.0.0
+// @version      1.0.1
 // @match        https://beat-battle.net/*
 // @match        https://*.beat-battle.net/*
 // @run-at       document-start
@@ -43,12 +43,13 @@
     resultsShown: false,
     resultsShownRoomId: null,
     notifiedNowPlaying: { revision: null, userId: null },
-    notifiedRatingVotes: [],
-    notifiedRatingVotesRoomId: null,
-    notifiedRatingVotesNeedsSeed: false,
-    notifiedRatingVoteSet: new Set(),
+    ratingVotes: {},
+    ratingVotesRoomId: null,
+    ratingVotesNeedsSeed: false,
     toastToggles: { votes: true, kicks: true, uploads: true, joins: false, left: false, results: true },
     hud: { hidden: false, collapsed: false, x: null, y: null },
+    ui: { tab: 'uploads', open: false, muted: false, sort: 'time', sound: false },
+    lastMsgAt: 0,
   };
 
   const DISCORD_INVITE = 'https://discord.gg/XrtrRWauDw';
@@ -62,9 +63,10 @@
   const LS_WEBHOOK_KEY = 'bb-webhook-url';
   const LS_WEBHOOK_TOGGLES_KEY = 'bb-webhook-toggles';
   const LS_RESULTS_PREFIX = 'bb-results-shown-';
-  const LS_NOTIFIED_RATING_PREFIX = 'bb-notified-rating-votes-';
+  const LS_RATING_VOTES_PREFIX = 'bb-rating-votes-';
   const LS_TOAST_TOGGLES_KEY = 'bb-toast-toggles';
   const LS_HUD_KEY = 'bb-hud-prefs';
+  const LS_UI_KEY = 'bb-ui-prefs';
 
   function getUrlSetting(key) {
     try {
@@ -148,6 +150,7 @@
   Object.assign(STATE.webhookToggles, getWebhookToggles() || {});
   Object.assign(STATE.toastToggles, getJsonSetting(LS_TOAST_TOGGLES_KEY) || {});
   Object.assign(STATE.hud, getJsonSetting(LS_HUD_KEY) || {});
+  Object.assign(STATE.ui, getJsonSetting(LS_UI_KEY) || {});
 
   function loadFromLS(prefix, roomId) {
     try {
@@ -172,6 +175,7 @@
     if (ws.__bbHooked) return;
     ws.__bbHooked = true;
     ws.addEventListener('message', (ev) => {
+      STATE.lastMsgAt = Date.now();
       let msg;
       try {
         msg = JSON.parse(ev.data);
@@ -273,6 +277,9 @@
 
     const scores = computeScores(room);
     const forfeitedIds = new Set(room.forfeitedUserIds || []);
+    const anyVotes = Object.keys(room.votesByUserId || {}).length > 0;
+    const votingActive = anyVotes || ['voting', 'showcase', 'results'].indexOf(room.gameState) !== -1;
+    const expectedVotes = votingActive ? Math.max(0, (room.members || []).length - 1) : 0;
 
     const allIds = Array.from(new Set([...Object.keys(memberById), ...Object.keys(uploaded)]));
 
@@ -296,8 +303,9 @@
         playbackUrl: beat ? beat.playbackUrl : null,
         uploadedAt: beat ? beat.uploadedAt : null,
         sha256: beat ? beat.sha256 : null,
-        score: scoreEntry ? scoreEntry.sum : null,
+        score: scoreEntry ? scoreEntry.sum : (expectedVotes && beat ? 0 : null),
         voteCount: scoreEntry ? scoreEntry.count : 0,
+        expectedVotes,
         dupeWith: [],
       };
     });
@@ -341,7 +349,8 @@
       .sort((a, b) => (b.score || 0) - (a.score || 0));
     const winner = ranked[0];
     if (winner) {
-      toast('results', `winner: ${winner.displayName}`, `${formatAvgRating(winner.score, winner.voteCount) || '?'}/5 from ${winner.voteCount} vote${winner.voteCount === 1 ? '' : 's'}`, {
+      playCue(880, 220);
+      toast('results', `winner: ${winner.displayName}`, `${formatAvgRating(winner.score, winner.expectedVotes) || '?'}/5 from ${winner.voteCount} vote${winner.voteCount === 1 ? '' : 's'}`, {
         tone: 'good',
         avatarUrl: avatarForUser(winner.userId),
         ttl: 12000,
@@ -420,9 +429,9 @@
     return rawScore + 3;
   }
 
-  function formatAvgRating(score, voteCount) {
-    if (score == null || !voteCount) return null;
-    return (score / voteCount + 3).toFixed(1);
+  function formatAvgRating(score, divisor) {
+    if (score == null || !divisor) return null;
+    return (score / divisor + 3).toFixed(1);
   }
 
   function computeScores(room) {
@@ -648,7 +657,7 @@
   function sendWebhookResults(room, ranked) {
     if (!STATE.webhookUrl || !STATE.webhookToggles.results) return;
     const fields = ranked.slice(0, 10).map((e, i) => {
-      const avgRating = formatAvgRating(e.score, e.voteCount);
+      const avgRating = formatAvgRating(e.score, e.expectedVotes);
       return {
         name: `#${i + 1} ${e.displayName}`,
         value: `${e.fileName} - ${avgRating != null ? `${avgRating}/5` : 'no votes'} (${e.voteCount} votes)`,
@@ -683,68 +692,95 @@
     });
   }
 
-  function sendWebhookRatingVote(room, voterId, vote) {
+  function sendWebhookRatingVote(room, ev) {
     if (!STATE.webhookUrl || !STATE.webhookToggles.votes) return;
-    const targetEntry = STATE.entries.find((e) => e.userId === vote.targetId);
+    const targetEntry = STATE.entries.find((e) => e.userId === ev.targetId);
+    const changed = ev.prevScore != null;
+    const fields = [
+      { name: 'Voter', value: nameFor(ev.voterId), inline: true },
+      { name: 'Target', value: nameFor(ev.targetId), inline: true },
+      { name: 'Rating', value: `${ratingFor(ev.score)}/5`, inline: true },
+    ];
+    if (changed) fields.push({ name: 'Was', value: `${ratingFor(ev.prevScore)}/5`, inline: true });
+    fields.push({ name: 'File', value: (targetEntry && targetEntry.fileName) || '?', inline: false });
     postWebhook(STATE.webhookUrl, {
       username: 'BeatBattleX',
       embeds: [{
-        title: `${nameFor(voterId)} rated ${nameFor(vote.targetId)}'s beat`,
-        fields: [
-          { name: 'Voter', value: nameFor(voterId), inline: true },
-          { name: 'Target', value: nameFor(vote.targetId), inline: true },
-          { name: 'Rating', value: `${ratingFor(vote.score)}/5`, inline: true },
-          { name: 'File', value: (targetEntry && targetEntry.fileName) || '?', inline: false },
-        ],
-        color: 0x7fffb0,
+        title: changed
+          ? `${nameFor(ev.voterId)} changed their rating of ${nameFor(ev.targetId)}'s beat`
+          : `${nameFor(ev.voterId)} rated ${nameFor(ev.targetId)}'s beat`,
+        fields,
+        color: changed ? 0xffd27f : 0x7fffb0,
       }],
     });
   }
 
+  function saveRatingVotes(roomId) {
+    try {
+      localStorage.setItem(LS_RATING_VOTES_PREFIX + roomId, JSON.stringify(STATE.ratingVotes));
+    } catch (e) {}
+  }
+
+  function splitVoteKey(key) {
+    const i = key.indexOf('|');
+    return { voterId: key.slice(0, i), targetId: key.slice(i + 1) };
+  }
+
   function detectRatingVotes(room) {
-    if (STATE.notifiedRatingVotesRoomId !== room.id) {
+    if (STATE.ratingVotesRoomId !== room.id) {
       let raw = null;
       try {
-        raw = localStorage.getItem(LS_NOTIFIED_RATING_PREFIX + room.id);
+        raw = localStorage.getItem(LS_RATING_VOTES_PREFIX + room.id);
       } catch (e) {}
-      STATE.notifiedRatingVotesNeedsSeed = raw === null;
-      STATE.notifiedRatingVotes = loadFromLS(LS_NOTIFIED_RATING_PREFIX, room.id);
-      STATE.notifiedRatingVoteSet = new Set(STATE.notifiedRatingVotes);
-      STATE.notifiedRatingVotesRoomId = room.id;
+      let parsed = null;
+      try {
+        parsed = raw ? JSON.parse(raw) : null;
+      } catch (e) {}
+      STATE.ratingVotesNeedsSeed = raw === null;
+      STATE.ratingVotes = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+      STATE.ratingVotesRoomId = room.id;
     }
 
     const votesByUserId = room.votesByUserId || {};
-    const allKeys = [];
+    const current = {};
     Object.keys(votesByUserId).forEach((voterId) => {
       (votesByUserId[voterId] || []).forEach((v) => {
-        allKeys.push(voterId + '|' + v.targetId);
+        current[voterId + '|' + v.targetId] = v.score;
       });
     });
 
-    if (STATE.notifiedRatingVotesNeedsSeed) {
-      STATE.notifiedRatingVotes = allKeys.slice();
-      STATE.notifiedRatingVoteSet = new Set(allKeys);
-      STATE.notifiedRatingVotesNeedsSeed = false;
-      saveToLS(LS_NOTIFIED_RATING_PREFIX, room.id, STATE.notifiedRatingVotes);
+    if (STATE.ratingVotesNeedsSeed) {
+      STATE.ratingVotes = current;
+      STATE.ratingVotesNeedsSeed = false;
+      saveRatingVotes(room.id);
       return;
     }
 
-    const fresh = [];
-    Object.keys(votesByUserId).forEach((voterId) => {
-      (votesByUserId[voterId] || []).forEach((v) => {
-        const key = voterId + '|' + v.targetId;
-        if (STATE.notifiedRatingVoteSet.has(key)) return;
-        STATE.notifiedRatingVoteSet.add(key);
-        STATE.notifiedRatingVotes.push(key);
-        fresh.push({ voterId, vote: v });
-      });
+    const events = [];
+    Object.keys(current).forEach((key) => {
+      const score = current[key];
+      const prev = STATE.ratingVotes[key];
+      if (prev === score) return;
+      const { voterId, targetId } = splitVoteKey(key);
+      events.push({ voterId, targetId, score, prevScore: prev === undefined ? null : prev });
+      STATE.ratingVotes[key] = score;
     });
-    if (!fresh.length) return;
+    if (!events.length) return;
 
-    saveToLS(LS_NOTIFIED_RATING_PREFIX, room.id, STATE.notifiedRatingVotes);
-    fresh.forEach(({ voterId, vote }) => {
-      toastRatingVote(voterId, vote);
-      sendWebhookRatingVote(room, voterId, vote);
+    saveRatingVotes(room.id);
+
+    // A voter submitting a whole card lands as one snapshot: N events at once.
+    // One toast each would blow past TOAST_MAX and evict itself in the same tick,
+    // so group per voter and show a single summary.
+    const byVoter = {};
+    events.forEach((ev) => {
+      (byVoter[ev.voterId] = byVoter[ev.voterId] || []).push(ev);
+      sendWebhookRatingVote(room, ev);
+    });
+    Object.keys(byVoter).forEach((voterId) => {
+      const list = byVoter[voterId];
+      if (list.length === 1) toastRatingVote(list[0]);
+      else toastRatingBatch(voterId, list);
     });
   }
 
@@ -827,6 +863,10 @@
 
   let toggleBtn, panel, listEl, statusEl, copyBtn, kickHistEl, membersEl, resultsEl, joinedMembersEl, leftMembersEl, chatEl, chatLogEl, chatCopyBtn, webhookInput, webhookSaveBtn;
   let hudEl, hudPhaseEl, hudMetaEl, hudProgressEl, hudRowsEl, hudShowBtn, toastWrap;
+  let tabsEl, toolbarEl, viewsEl, searchInput, sortSelect, muteBtn, headRoomEl;
+  let toggleDotEl, toggleLabelEl, downloadBtn;
+  const viewEls = {};
+  let uiQuery = '';
 
   function ensureUI() {
     if (toggleBtn) return;
@@ -834,277 +874,489 @@
     const style = document.createElement('style');
     style.textContent = `
       :root {
-        --bb2-bg: #111116;
-        --bb2-surface: #18181f;
-        --bb2-surface-hover: #1e1e26;
-        --bb2-border: rgba(255,255,255,0.08);
-        --bb2-border-strong: rgba(255,255,255,0.16);
-        --bb2-ink: #e6e6ec;
-        --bb2-muted: #a3a3ae;
-        --bb2-muted-soft: #75757f;
-        --bb2-accent: #a3a3dd;
-        --bb2-accent-soft: #cfcfef;
-        --bb2-positive: #86d6a8;
-        --bb2-positive-bg: rgba(134,214,168,0.14);
-        --bb2-negative: #e0918f;
-        --bb2-negative-bg: rgba(224,145,143,0.14);
-        --bb2-warning: #ddc088;
-        --bb2-info: #8fc0e0;
-        --bb2-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+        --bb2-bg: #0f0f12;
+        --bb2-surface: #17181c;
+        --bb2-surface-hover: #1f2027;
+        --bb2-border: rgba(255,255,255,0.07);
+        --bb2-border-strong: rgba(255,255,255,0.15);
+        --bb2-ink: #eceef2;
+        --bb2-muted: #9aa0aa;
+        --bb2-muted-soft: #676d77;
+        --bb2-accent: #c9f24a;
+        --bb2-accent-soft: #e6ffab;
+        --bb2-positive: #5fcf9a;
+        --bb2-positive-bg: rgba(95,207,154,0.13);
+        --bb2-negative: #e3746c;
+        --bb2-negative-bg: rgba(227,116,108,0.13);
+        --bb2-warning: #e6b45c;
+        --bb2-info: #7fb2d9;
+        --bb2-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        --bb2-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
       }
+
       #bb-overlay-toggle {
-        position: fixed; bottom: 8px; right: 8px; z-index: 999999;
-        background: var(--bb2-surface);
-        color: var(--bb2-ink); border: 1px solid var(--bb2-border-strong);
-        border-radius: 8px; padding: 7px 13px;
-        font: 500 13.5px/1 var(--bb2-font);
-        cursor: pointer; opacity: 0.92; user-select: none;
-        box-shadow: 0 2px 10px rgba(0,0,0,.35);
-        transition: opacity .15s, transform .1s, background .3s;
-      }
-      #bb-overlay-toggle:hover { opacity: 1; transform: translateY(-1px); background: var(--bb2-surface-hover); }
-      #bb-overlay-toggle:active { transform: translateY(0); }
-      #bb-overlay-toggle.bb-flash { background: var(--bb2-positive-bg); border-color: var(--bb2-positive); color: var(--bb2-positive); }
-      #bb-overlay-panel {
-        position: fixed; bottom: 46px; right: 8px; z-index: 999999;
-        width: 380px; max-height: 72vh; overflow-y: auto;
+        position: fixed; bottom: 10px; right: 10px; z-index: 999999;
+        display: flex; align-items: center; gap: 7px;
         background: var(--bb2-bg); color: var(--bb2-ink);
-        border: 1px solid var(--bb2-border-strong); border-bottom: 2px solid var(--bb2-accent);
-        border-radius: 12px; padding: 14px;
-        font: 400 13.5px/1.55 var(--bb2-font);
-        display: none; box-shadow: 0 12px 32px rgba(0,0,0,.45);
+        border: 1px solid var(--bb2-border-strong); border-radius: 5px;
+        padding: 6px 11px 6px 9px;
+        font: 500 12.5px/1 var(--bb2-font);
+        cursor: pointer; user-select: none;
+        transition: border-color .15s, background .15s, color .35s;
       }
-      #bb-overlay-panel.open { display: block; }
-      #bb-overlay-panel::-webkit-scrollbar { width: 9px; }
-      #bb-overlay-panel::-webkit-scrollbar-thumb { background: var(--bb2-border-strong); border-radius: 5px; }
-      #bb-overlay-panel .bb-section-title {
-        font-size: 11.5px; font-weight: 600; letter-spacing: .3px;
-        color: var(--bb2-muted-soft); margin: 2px 0 6px;
+      #bb-overlay-toggle:hover { background: var(--bb2-surface); border-color: var(--bb2-muted-soft); }
+      #bb-overlay-toggle.bb-flash { color: var(--bb2-positive); border-color: var(--bb2-positive); }
+      #bb-toggle-label { font-variant-numeric: tabular-nums; }
+      .bb-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--bb2-muted-soft); transition: background .3s; }
+      .bb-dot.bb-live { background: var(--bb2-accent); box-shadow: 0 0 0 3px rgba(201,242,74,.13); }
+      .bb-dot.bb-stale { background: var(--bb2-warning); }
+
+      #bb-overlay-panel {
+        position: fixed; bottom: 48px; right: 10px; z-index: 999999;
+        width: 404px; max-width: calc(100vw - 20px);
+        max-height: min(78vh, 780px);
+        display: none; flex-direction: column;
+        background: var(--bb2-bg); color: var(--bb2-ink);
+        border: 1px solid var(--bb2-border-strong); border-radius: 6px;
+        font: 400 13px/1.5 var(--bb2-font);
+        box-shadow: 0 18px 44px rgba(0,0,0,.55);
+        overflow: hidden;
       }
-      #bb-overlay-panel .bb-entry {
-        border-bottom: 1px solid var(--bb2-border); padding: 8px 6px; word-break: break-word;
-        border-radius: 6px; transition: background .12s;
-      }
-      #bb-overlay-panel .bb-entry:hover { background: var(--bb2-surface); }
-      #bb-overlay-panel .bb-entry:last-child { border-bottom: none; }
-      #bb-overlay-panel .bb-fn { color: var(--bb2-info); font-weight: 600; }
-      #bb-overlay-panel .bb-who { color: var(--bb2-ink); }
-      #bb-overlay-panel .bb-meta { color: var(--bb2-muted); }
-      #bb-overlay-panel a { color: var(--bb2-positive); text-decoration: none; }
+      #bb-overlay-panel.open { display: flex; }
+      #bb-overlay-panel a { color: var(--bb2-info); text-decoration: none; }
       #bb-overlay-panel a:hover { text-decoration: underline; }
-      #bb-overlay-panel .bb-empty { color: var(--bb2-muted-soft); font-style: italic; }
-      #bb-overlay-panel .bb-score { color: var(--bb2-positive); }
+      #bb-overlay-panel button {
+        background: var(--bb2-surface); color: var(--bb2-ink);
+        border: 1px solid var(--bb2-border-strong); border-radius: 4px;
+        padding: 6px 10px; font: 500 11.5px var(--bb2-font); cursor: pointer;
+        transition: background .15s, border-color .15s, color .15s;
+      }
+      #bb-overlay-panel button:hover { background: var(--bb2-surface-hover); border-color: var(--bb2-muted-soft); }
+      #bb-overlay-panel button.bb-copied { color: var(--bb2-accent); border-color: var(--bb2-accent); }
+      .bb-btn-row { display: flex; flex-wrap: wrap; gap: 6px; }
+
+      #bb-head {
+        display: flex; align-items: center; gap: 8px; flex: none;
+        padding: 9px 10px; background: var(--bb2-surface);
+        border-bottom: 1px solid var(--bb2-border);
+      }
+      #bb-head-title { font-weight: 650; font-size: 13px; letter-spacing: -.01em; }
+      #bb-head-title .bb-x { color: var(--bb2-accent); }
+      #bb-head-room { font: 500 11px var(--bb2-mono); color: var(--bb2-muted); }
+      .bb-spacer { flex: 1; }
+      #bb-overlay-panel button.bb-icon-btn {
+        background: none; border-color: transparent; color: var(--bb2-muted);
+        padding: 3px 7px; font-size: 11px;
+      }
+      #bb-overlay-panel button.bb-icon-btn:hover { color: var(--bb2-ink); background: var(--bb2-surface-hover); border-color: var(--bb2-border); }
+      #bb-overlay-panel button.bb-icon-btn.bb-on { color: var(--bb2-accent); border-color: var(--bb2-border-strong); }
+
+      #bb-status { flex: none; padding: 9px 10px; border-bottom: 1px solid var(--bb2-border); }
+      #bb-status:empty { display: none; }
+      .bb-room-line { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
+      .bb-room-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .bb-room-code { font: 500 11px var(--bb2-mono); color: var(--bb2-accent); flex: none; }
+      .bb-pill {
+        flex: none; font: 500 10px var(--bb2-font); letter-spacing: .02em;
+        border: 1px solid var(--bb2-border-strong); border-radius: 20px;
+        padding: 1px 7px; color: var(--bb2-muted); white-space: nowrap;
+      }
+      .bb-facts { display: flex; flex-wrap: wrap; gap: 1px 14px; color: var(--bb2-muted); font-size: 11.5px; }
+      .bb-fact b { font: 500 11.5px var(--bb2-mono); color: var(--bb2-ink); }
+      .bb-timer { font-family: var(--bb2-mono); color: var(--bb2-warning); }
+      .bb-timer.bb-urgent { color: var(--bb2-negative); animation: bb-pulse 1s ease-in-out infinite; }
+      @keyframes bb-pulse { 50% { opacity: .4; } }
+      .bb-note { margin-top: 5px; font-size: 12px; color: var(--bb2-muted); }
+      .bb-note.bb-playing { color: var(--bb2-positive); }
+      .bb-note.bb-kick { color: var(--bb2-negative); }
+      .bb-note b { font-weight: 600; color: var(--bb2-ink); }
+
+      #bb-tabs { display: flex; flex: none; gap: 1px; padding: 0 5px; border-bottom: 1px solid var(--bb2-border); }
+      #bb-overlay-panel button.bb-tab {
+        background: none; border: none; border-bottom: 2px solid transparent;
+        color: var(--bb2-muted-soft); padding: 8px 9px 6px; margin-bottom: -1px;
+        font: 500 12px var(--bb2-font); border-radius: 0;
+      }
+      #bb-overlay-panel button.bb-tab:hover { color: var(--bb2-ink); background: none; }
+      #bb-overlay-panel button.bb-tab.bb-active { color: var(--bb2-ink); border-bottom-color: var(--bb2-accent); }
+      .bb-tab-badge { margin-left: 5px; font: 500 10px var(--bb2-mono); color: var(--bb2-muted-soft); }
+      .bb-tab.bb-active .bb-tab-badge { color: var(--bb2-accent); }
+
+      #bb-toolbar { display: flex; flex: none; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--bb2-border); }
+      #bb-toolbar[hidden] { display: none; }
+      #bb-search, #bb-sort {
+        background: var(--bb2-surface); color: var(--bb2-ink);
+        border: 1px solid var(--bb2-border); border-radius: 4px;
+        font: 400 12px var(--bb2-font);
+      }
+      #bb-search { flex: 1; min-width: 0; padding: 5px 8px; }
+      #bb-search::placeholder { color: var(--bb2-muted-soft); }
+      #bb-sort { padding: 5px 6px; color: var(--bb2-muted); font-size: 11.5px; cursor: pointer; }
+      #bb-search:focus, #bb-sort:focus, #bb-webhook-input:focus, #bb-known-users-webhook-input:focus {
+        outline: none; border-color: var(--bb2-accent);
+      }
+
+      #bb-views { flex: 1; overflow-y: auto; padding: 10px; }
+      #bb-views::-webkit-scrollbar { width: 11px; }
+      #bb-views::-webkit-scrollbar-thumb {
+        background: var(--bb2-surface-hover); border-radius: 6px; border: 3px solid var(--bb2-bg);
+      }
+      #bb-chat-log::-webkit-scrollbar { width: 9px; }
+      #bb-chat-log::-webkit-scrollbar-thumb { background: var(--bb2-surface-hover); border-radius: 5px; }
+      .bb-view[hidden] { display: none; }
+      .bb-view > div + div { margin-top: 15px; }
+      .bb-view > div:empty { display: none; margin: 0; }
+
+      .bb-section-title {
+        display: flex; align-items: center; gap: 8px;
+        font: 600 12px var(--bb2-font); color: var(--bb2-ink); margin: 0 0 8px;
+      }
+      .bb-section-title::after { content: ''; flex: 1; height: 1px; background: var(--bb2-border); }
+      .bb-count { font: 500 11px var(--bb2-mono); color: var(--bb2-muted-soft); }
+      .bb-empty { color: var(--bb2-muted-soft); font-size: 12px; }
+      #bb-overlay-panel .bb-meta { color: var(--bb2-muted); font-size: 11.5px; }
+      #bb-overlay-panel .bb-mono { font-family: var(--bb2-mono); }
+
+      #bb-overlay-panel .bb-entry {
+        padding: 8px 9px; margin-bottom: 6px; border-radius: 5px;
+        background: var(--bb2-surface); border: 1px solid transparent;
+        word-break: break-word;
+      }
+      #bb-overlay-panel .bb-entry:hover { border-color: var(--bb2-border-strong); }
+      #bb-overlay-panel .bb-entry.bb-no-upload { background: none; border: 1px dashed var(--bb2-border); }
+      #bb-overlay-panel .bb-entry.bb-left { opacity: .68; }
+      #bb-overlay-panel .bb-fn {
+        font: 500 12.5px var(--bb2-mono); color: var(--bb2-ink);
+        margin-bottom: 2px; word-break: break-all;
+      }
+      #bb-overlay-panel .bb-fn.bb-meta { color: var(--bb2-muted-soft); font-family: var(--bb2-font); }
+      #bb-overlay-panel .bb-who { font-size: 12.5px; }
+      #bb-overlay-panel .bb-score { font: 500 12px var(--bb2-mono); color: var(--bb2-positive); }
       #bb-overlay-panel .bb-score.neg { color: var(--bb2-negative); }
-      #bb-overlay-panel .bb-dupe { color: var(--bb2-negative); font-weight: 600; }
-      #bb-status {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
-        color: var(--bb2-muted);
+      #bb-overlay-panel .bb-dupe { color: var(--bb2-negative); font-weight: 600; font-size: 11.5px; }
+      .bb-name { cursor: pointer; }
+      .bb-name:hover { text-decoration: underline dotted; text-underline-offset: 2px; }
+      .bb-copied-flash { color: var(--bb2-accent) !important; }
+
+      #bb-members .bb-member-row {
+        display: flex; align-items: center; gap: 8px;
+        padding: 5px 6px; border-radius: 4px;
       }
-      #bb-status .bb-status-line { margin: 3px 0; }
-      #bb-status .bb-phase { color: var(--bb2-info); }
-      #bb-status .bb-timer { color: var(--bb2-warning); }
-      #bb-status .bb-playing { color: var(--bb2-positive); }
-      #bb-status .bb-kick { color: var(--bb2-negative); }
-      #bb-kick-history {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
+      #bb-members .bb-member-row:hover { background: var(--bb2-surface); }
+      .bb-ready-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; background: var(--bb2-muted-soft); }
+      .bb-ready-dot.bb-is-ready { background: var(--bb2-positive); }
+      .bb-name-cell { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
+      .bb-member-tags { flex: none; display: flex; gap: 6px; font-size: 10.5px; color: var(--bb2-muted-soft); }
+
+      #bb-results .bb-result-row {
+        display: flex; gap: 9px; align-items: baseline;
+        padding: 5px 6px; border-radius: 4px; font-size: 12.5px;
       }
-      #bb-kick-history:empty { border: none; margin: 0; padding: 0; }
-      #bb-kick-history .bb-kick-hist-entry {
-        margin: 5px 0; padding: 6px 8px; border-top: none;
-        background: var(--bb2-surface); border-radius: 6px;
+      #bb-results .bb-result-row:nth-child(odd) { background: var(--bb2-surface); }
+      #bb-results .bb-rank { flex: none; min-width: 22px; font: 600 11px var(--bb2-mono); color: var(--bb2-muted-soft); }
+      #bb-results .bb-result-row.bb-first .bb-rank { color: var(--bb2-accent); }
+      #bb-results .bb-result-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #bb-results .bb-result-score { flex: none; font: 500 12px var(--bb2-mono); }
+
+      .bb-log-entry {
+        padding: 6px 8px; margin-bottom: 5px; border-radius: 5px;
+        background: var(--bb2-surface); font-size: 12px;
+        border-left: 2px solid var(--bb2-border-strong);
       }
-      #bb-members {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
-      }
-      #bb-members .bb-member-row { margin: 3px 0; }
-      #bb-members .bb-ready { color: var(--bb2-positive); }
-      #bb-members .bb-not-ready { color: var(--bb2-muted-soft); }
-      #bb-results {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
-      }
-      #bb-results:empty { border: none; margin: 0; padding: 0; }
-      #bb-results .bb-result-row { margin: 4px 0; }
-      #bb-results .bb-rank { color: var(--bb2-positive); font-weight: 600; }
-      #bb-joined-members {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
-      }
-      #bb-joined-members:empty { border: none; margin: 0; padding: 0; }
-      #bb-left-members {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
-      }
-      #bb-left-members:empty { border: none; margin: 0; padding: 0; }
-      #bb-overlay-panel .bb-entry.bb-no-upload { opacity: 0.6; }
-      #bb-overlay-panel .bb-entry.bb-left { border-left: 2px solid var(--bb2-border-strong); padding-left: 8px; }
-      #bb-chat {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
-      }
+      .bb-log-entry.bb-log-in { border-left-color: var(--bb2-positive); }
+      .bb-log-entry.bb-log-out { border-left-color: var(--bb2-negative); }
+      .bb-log-entry.bb-log-kick { border-left-color: var(--bb2-warning); }
+      .bb-when { font: 400 10.5px var(--bb2-mono); color: var(--bb2-muted-soft); }
+
+      #bb-chat-top { color: var(--bb2-muted-soft); font-size: 11.5px; margin-bottom: 7px; }
       #bb-chat-log {
-        max-height: 160px; overflow-y: auto; background: var(--bb2-surface);
-        border-radius: 6px; padding: 6px 8px;
+        max-height: 320px; overflow-y: auto;
+        background: var(--bb2-surface); border: 1px solid var(--bb2-border);
+        border-radius: 5px; padding: 7px 9px;
       }
-      #bb-chat-log .bb-chat-row { margin: 3px 0; word-break: break-word; }
-      #bb-chat-log .bb-chat-time { color: var(--bb2-muted-soft); }
-      #bb-chat-log .bb-chat-name { color: var(--bb2-ink); font-weight: 600; }
+      #bb-chat-log .bb-chat-row { margin: 3px 0; word-break: break-word; font-size: 12.5px; }
+      #bb-chat-log .bb-chat-time { font: 400 10.5px var(--bb2-mono); color: var(--bb2-muted-soft); margin-right: 3px; }
+      #bb-chat-log .bb-chat-name { font-weight: 600; }
       #bb-chat-log .bb-chat-avatar {
         width: 14px; height: 14px; border-radius: 50%;
-        vertical-align: middle; margin-right: 4px; object-fit: cover;
+        vertical-align: -2px; margin-right: 4px; object-fit: cover;
       }
-      #bb-chat-top { color: var(--bb2-muted-soft); margin-bottom: 6px; }
-      #bb-webhook-wrap {
-        border-bottom: 1px solid var(--bb2-border); padding-bottom: 9px; margin-bottom: 9px;
+
+      .bb-toggle-grid { display: flex; flex-wrap: wrap; gap: 5px 14px; margin: 7px 0 10px; }
+      .bb-webhook-toggle {
+        display: inline-flex; align-items: center; gap: 5px;
+        font-size: 11.5px; color: var(--bb2-muted); cursor: pointer;
       }
-      #bb-webhook-input {
-        display: block; width: 100%; box-sizing: border-box; margin-bottom: 7px;
-        background: var(--bb2-surface); color: var(--bb2-ink); border: 1px solid var(--bb2-border-strong);
-        border-radius: 6px; padding: 6px 8px; font: 12px var(--bb2-font);
+      .bb-webhook-toggle input { accent-color: var(--bb2-accent); margin: 0; }
+      #bb-webhook-input, #bb-known-users-webhook-input {
+        display: block; width: 100%; box-sizing: border-box; margin-bottom: 8px;
+        background: var(--bb2-surface); color: var(--bb2-ink);
+        border: 1px solid var(--bb2-border); border-radius: 4px;
+        padding: 6px 8px; font: 400 11.5px var(--bb2-mono);
       }
-      #bb-webhook-input:focus { outline: none; border-color: var(--bb2-accent); }
-      .bb-toggle-grid {
-        display: flex; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 7px; color: var(--bb2-muted);
+      #bb-known-users button { margin: 0 5px 5px 0; }
+      .bb-hint { color: var(--bb2-muted-soft); font-size: 11px; margin: -2px 0 8px; }
+      .bb-keys { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--bb2-muted-soft); }
+      .bb-keys kbd {
+        font: 500 10.5px var(--bb2-mono); color: var(--bb2-muted);
+        border: 1px solid var(--bb2-border-strong); border-bottom-width: 2px;
+        border-radius: 3px; padding: 0 4px;
       }
-      .bb-toggle-grid .bb-webhook-toggle {
-        display: inline-flex; align-items: center; gap: 4px; cursor: pointer; font-size: 11px;
-      }
-      #bb-copy-btn, #bb-chat-copy-btn, #bb-webhook-save-btn, #bb-hud-show-btn {
-        display: block; width: 100%; margin-bottom: 8px;
-        background: var(--bb2-surface);
-        color: var(--bb2-ink); border: 1px solid var(--bb2-border-strong);
-        border-radius: 6px; padding: 7px; font: 500 12px var(--bb2-font);
-        cursor: pointer; text-align: center; transition: background .15s;
-      }
-      #bb-copy-btn:hover, #bb-chat-copy-btn:hover, #bb-webhook-save-btn:hover, #bb-hud-show-btn:hover { background: var(--bb2-surface-hover); }
-      #bb-copy-btn.bb-copied, #bb-chat-copy-btn.bb-copied, #bb-webhook-save-btn.bb-copied {
-        background: var(--bb2-positive-bg); color: var(--bb2-positive); border-color: var(--bb2-positive);
-      }
+
       #bb-credits {
-        margin-top: 8px; padding-top: 9px; border-top: 1px solid var(--bb2-border);
-        color: var(--bb2-muted-soft); font-size: 10.5px; text-align: center; line-height: 1.6;
+        margin-top: 16px; padding-top: 11px; border-top: 1px solid var(--bb2-border);
+        color: var(--bb2-muted-soft); font-size: 11px; line-height: 1.7;
       }
-      #bb-credits a { color: var(--bb2-accent); }
-      #bb-credits a:hover { text-decoration: underline; }
+      #bb-credits a { color: var(--bb2-muted); }
+      #bb-credits a:hover { color: var(--bb2-ink); text-decoration: none; }
       #bb-credits .bb-discord-cta {
-        display: inline-block; margin-top: 6px; padding: 5px 10px;
-        border: 1px solid var(--bb2-border-strong); border-radius: 6px;
-        color: var(--bb2-accent-soft); font-size: 11px; font-weight: 600;
-        transition: background .15s, border-color .15s;
+        display: inline-block; margin-top: 8px; padding: 5px 11px;
+        border: 1px solid var(--bb2-border-strong); border-radius: 4px;
+        color: var(--bb2-accent-soft); font-weight: 600;
       }
-      #bb-credits .bb-discord-cta:hover { background: var(--bb2-surface-hover); border-color: var(--bb2-accent); text-decoration: none; }
+      #bb-credits .bb-discord-cta:hover { border-color: var(--bb2-accent); color: var(--bb2-accent); }
 
       #bb-hud {
-        position: fixed; top: 8px; right: 8px; z-index: 999998;
-        width: 268px; background: var(--bb2-bg); color: var(--bb2-ink);
-        border: 1px solid var(--bb2-border-strong); border-top: 2px solid var(--bb2-accent);
-        border-radius: 10px; overflow: hidden;
+        position: fixed; top: 10px; right: 10px; z-index: 999998;
+        width: 274px; background: var(--bb2-bg); color: var(--bb2-ink);
+        border: 1px solid var(--bb2-border-strong); border-radius: 6px; overflow: hidden;
         font: 400 12.5px/1.45 var(--bb2-font);
-        box-shadow: 0 10px 28px rgba(0,0,0,.45);
+        box-shadow: 0 12px 30px rgba(0,0,0,.5);
         display: none;
       }
       #bb-hud.bb-hud-on { display: block; }
       #bb-hud-head {
-        display: flex; align-items: center; gap: 6px;
-        padding: 7px 8px; background: var(--bb2-surface);
+        display: flex; align-items: center; gap: 7px;
+        padding: 7px 9px; background: var(--bb2-surface);
         border-bottom: 1px solid var(--bb2-border); cursor: grab; user-select: none;
       }
       #bb-hud-head:active { cursor: grabbing; }
-      #bb-hud-title { font-weight: 600; font-size: 11.5px; letter-spacing: .4px; text-transform: uppercase; color: var(--bb2-accent-soft); }
+      #bb-hud-title { font: 600 11.5px var(--bb2-font); letter-spacing: .01em; }
       #bb-hud-phase {
-        margin-left: auto; font-size: 10px; color: var(--bb2-muted);
-        border: 1px solid var(--bb2-border); border-radius: 20px; padding: 1px 7px; white-space: nowrap;
+        margin-left: auto; font: 500 10px var(--bb2-mono); color: var(--bb2-muted);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px;
       }
       #bb-hud-head button {
         background: none; border: none; color: var(--bb2-muted-soft);
-        cursor: pointer; font: 600 13px/1 var(--bb2-font); padding: 2px 3px; border-radius: 4px;
+        cursor: pointer; font: 600 13px/1 var(--bb2-font); padding: 2px 4px; border-radius: 3px;
       }
       #bb-hud-head button:hover { color: var(--bb2-ink); background: var(--bb2-surface-hover); }
       #bb-hud.bb-collapsed #bb-hud-body { display: none; }
-      #bb-hud-body { padding: 8px; }
-      #bb-hud-meta { color: var(--bb2-muted); font-size: 11px; margin-bottom: 6px; word-break: break-word; }
-      #bb-hud-meta .bb-hud-timer { color: var(--bb2-warning); font-variant-numeric: tabular-nums; }
-      #bb-hud-progress { margin-bottom: 7px; }
+      #bb-hud-body { padding: 9px; }
+      #bb-hud-meta { color: var(--bb2-muted); font-size: 11px; margin-bottom: 7px; word-break: break-word; }
+      #bb-hud-meta .bb-hud-timer { font-family: var(--bb2-mono); color: var(--bb2-warning); }
+      #bb-hud-meta .bb-hud-timer.bb-urgent { color: var(--bb2-negative); }
+      #bb-hud-progress { margin-bottom: 9px; }
       #bb-hud-progress .bb-hud-prog-label {
-        display: flex; justify-content: space-between; font-size: 10.5px; color: var(--bb2-muted-soft); margin-bottom: 3px;
+        display: flex; justify-content: space-between;
+        font: 500 10px var(--bb2-mono); color: var(--bb2-muted-soft); margin-bottom: 4px;
       }
-      .bb-hud-track { height: 4px; border-radius: 3px; background: var(--bb2-surface-hover); overflow: hidden; }
-      .bb-hud-track > i { display: block; height: 100%; border-radius: 3px; background: var(--bb2-accent); transition: width .35s ease; }
-      #bb-hud-rows { display: flex; flex-direction: column; gap: 5px; }
+      .bb-hud-track { height: 3px; border-radius: 2px; background: var(--bb2-surface-hover); overflow: hidden; }
+      .bb-hud-track > i { display: block; height: 100%; background: var(--bb2-accent); transition: width .35s ease; }
+      #bb-hud-rows { display: flex; flex-direction: column; gap: 4px; }
       .bb-hud-row {
-        display: grid; grid-template-columns: 16px 20px 1fr auto; gap: 6px;
-        align-items: center; padding: 3px 4px; border-radius: 6px; transition: background .12s;
+        display: grid; grid-template-columns: 15px 20px 1fr auto; gap: 7px;
+        align-items: center; padding: 3px 4px; border-radius: 4px;
       }
       .bb-hud-row:hover { background: var(--bb2-surface); }
-      .bb-hud-row.bb-hud-me { background: var(--bb2-surface); }
-      .bb-hud-rank { color: var(--bb2-muted-soft); font-size: 10.5px; text-align: right; font-variant-numeric: tabular-nums; }
-      .bb-hud-row.bb-hud-top .bb-hud-rank { color: var(--bb2-warning); font-weight: 700; }
+      .bb-hud-rank { font: 500 10px var(--bb2-mono); color: var(--bb2-muted-soft); text-align: right; }
+      .bb-hud-row.bb-hud-top .bb-hud-rank { color: var(--bb2-accent); font-weight: 700; }
       .bb-hud-av { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; background: var(--bb2-surface-hover); }
       .bb-hud-main { min-width: 0; }
       .bb-hud-name { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
-      .bb-hud-sub { display: flex; align-items: center; gap: 5px; margin-top: 2px; }
+      .bb-hud-sub { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
       .bb-hud-sub .bb-hud-track { flex: 1; }
-      .bb-hud-votes { font-size: 9.5px; color: var(--bb2-muted-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
-      .bb-hud-val { font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+      .bb-hud-votes { font: 400 9.5px var(--bb2-mono); color: var(--bb2-muted-soft); white-space: nowrap; }
+      .bb-hud-val { font: 600 13px var(--bb2-mono); white-space: nowrap; }
       .bb-hud-val small { font-weight: 400; font-size: 9.5px; color: var(--bb2-muted-soft); }
       .bb-tone-good { color: var(--bb2-positive); } .bb-fill-good { background: var(--bb2-positive) !important; }
       .bb-tone-info { color: var(--bb2-info); }     .bb-fill-info { background: var(--bb2-info) !important; }
       .bb-tone-warn { color: var(--bb2-warning); }  .bb-fill-warn { background: var(--bb2-warning) !important; }
       .bb-tone-bad  { color: var(--bb2-negative); } .bb-fill-bad  { background: var(--bb2-negative) !important; }
       .bb-tone-mute { color: var(--bb2-muted-soft); }
-      #bb-hud-rows .bb-hud-pending { opacity: .55; }
+      #bb-hud-rows .bb-hud-pending { opacity: .5; }
       #bb-hud-foot {
-        margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--bb2-border);
-        display: flex; align-items: center; justify-content: space-between; font-size: 10px; color: var(--bb2-muted-soft);
+        margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--bb2-border);
+        display: flex; align-items: center; justify-content: space-between;
+        font-size: 10px; color: var(--bb2-muted-soft);
       }
-      #bb-hud-foot a { color: var(--bb2-accent); text-decoration: none; }
-      #bb-hud-foot a:hover { text-decoration: underline; }
-      #bb-hud-empty { color: var(--bb2-muted-soft); font-style: italic; font-size: 11.5px; }
+      #bb-hud-foot a { color: var(--bb2-muted); text-decoration: none; }
+      #bb-hud-foot a:hover { color: var(--bb2-accent); }
+      #bb-hud-empty { color: var(--bb2-muted-soft); font-size: 11.5px; }
 
       #bb-toasts {
-        position: fixed; bottom: 8px; left: 8px; z-index: 1000000;
-        display: flex; flex-direction: column-reverse; gap: 7px;
-        max-width: 292px; pointer-events: none;
+        position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 1000000;
+        display: flex; flex-direction: column-reverse; align-items: stretch; gap: 6px;
+        width: max-content; max-width: min(92vw, 350px); pointer-events: none;
       }
       .bb-toast {
-        display: flex; gap: 8px; align-items: flex-start;
-        background: var(--bb2-surface); color: var(--bb2-ink);
-        border: 1px solid var(--bb2-border-strong); border-left: 3px solid var(--bb2-accent);
-        border-radius: 8px; padding: 8px 10px;
+        display: flex; gap: 9px; align-items: flex-start;
+        background: var(--bb2-bg); color: var(--bb2-ink);
+        border: 1px solid var(--bb2-border-strong); border-left: 2px solid var(--bb2-accent);
+        border-radius: 5px; padding: 8px 11px;
         font: 400 12px/1.4 var(--bb2-font);
-        box-shadow: 0 6px 20px rgba(0,0,0,.45);
+        box-shadow: 0 8px 24px rgba(0,0,0,.5);
         cursor: pointer; pointer-events: auto;
         animation: bb-toast-in .22s ease-out;
       }
-      .bb-toast:hover { background: var(--bb2-surface-hover); }
+      .bb-toast:hover { background: var(--bb2-surface); }
       .bb-toast.bb-toast-out { animation: bb-toast-out .18s ease-in forwards; }
       .bb-toast.bb-tone-good { border-left-color: var(--bb2-positive); }
       .bb-toast.bb-tone-info { border-left-color: var(--bb2-info); }
       .bb-toast.bb-tone-warn { border-left-color: var(--bb2-warning); }
       .bb-toast.bb-tone-bad  { border-left-color: var(--bb2-negative); }
-      .bb-toast-av { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; background: var(--bb2-bg); }
+      .bb-toast-av { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; flex: none; background: var(--bb2-surface); }
       .bb-toast-text { min-width: 0; }
       .bb-toast-title { font-weight: 600; word-break: break-word; }
-      .bb-toast-body { color: var(--bb2-muted); font-size: 11px; word-break: break-word; }
+      .bb-toast-body { color: var(--bb2-muted); font-size: 11px; word-break: break-word; margin-top: 1px; }
       .bb-toast-stars { letter-spacing: 1px; }
       .bb-toast-count {
-        margin-left: 6px; font-size: 10px; color: var(--bb2-muted-soft);
+        margin-left: 6px; font: 500 10px var(--bb2-mono); color: var(--bb2-muted-soft);
         border: 1px solid var(--bb2-border); border-radius: 10px; padding: 0 5px;
       }
-      @keyframes bb-toast-in { from { opacity: 0; transform: translateX(-14px) scale(.97); } to { opacity: 1; transform: none; } }
-      @keyframes bb-toast-out { to { opacity: 0; transform: translateX(-14px); } }
+      .bb-toast.bb-toast-bump { animation: bb-toast-bump .3s ease-out; }
+      @keyframes bb-toast-in { from { opacity: 0; transform: translateY(-14px) scale(.97); } to { opacity: 1; transform: none; } }
+      @keyframes bb-toast-out { to { opacity: 0; transform: translateY(-10px); } }
+      @keyframes bb-toast-bump {
+        0% { transform: scale(1); } 40% { transform: scale(1.035); } 100% { transform: scale(1); }
+      }
       @media (prefers-reduced-motion: reduce) {
-        .bb-toast, .bb-toast.bb-toast-out { animation: none; }
+        .bb-toast, .bb-toast.bb-toast-out, .bb-toast.bb-toast-bump { animation: none; }
         .bb-hud-track > i { transition: none; }
+        .bb-timer.bb-urgent { animation: none; }
       }
     `;
     document.documentElement.appendChild(style);
 
     toggleBtn = document.createElement('div');
     toggleBtn.id = 'bb-overlay-toggle';
-    toggleBtn.textContent = 'uploads (0)';
-    toggleBtn.addEventListener('click', () => {
-      panel.classList.toggle('open');
-    });
+    toggleBtn.title = 'BeatBattleX — alt+B';
+    toggleBtn.innerHTML = '<span id="bb-toggle-dot" class="bb-dot"></span><span id="bb-toggle-label">0/0 uploads</span>';
+    toggleDotEl = toggleBtn.querySelector('#bb-toggle-dot');
+    toggleLabelEl = toggleBtn.querySelector('#bb-toggle-label');
+    toggleBtn.addEventListener('click', () => setPanelOpen(!STATE.ui.open));
 
     panel = document.createElement('div');
     panel.id = 'bb-overlay-panel';
+
+    const head = document.createElement('div');
+    head.id = 'bb-head';
+    head.innerHTML = `
+      <span id="bb-head-title">BeatBattle<span class="bb-x">X</span></span>
+      <span id="bb-head-room"></span>
+      <span class="bb-spacer"></span>
+      <button id="bb-mute-btn" class="bb-icon-btn">toasts</button>
+      <button id="bb-hud-btn" class="bb-icon-btn" title="score HUD (alt+H)">HUD</button>
+      <button id="bb-close-btn" class="bb-icon-btn" title="close (esc)">&times;</button>
+    `;
+    headRoomEl = head.querySelector('#bb-head-room');
+    muteBtn = head.querySelector('#bb-mute-btn');
+    muteBtn.addEventListener('click', () => {
+      STATE.ui.muted = !STATE.ui.muted;
+      saveUiPrefs();
+      syncChrome();
+    });
+    hudShowBtn = head.querySelector('#bb-hud-btn');
+    hudShowBtn.addEventListener('click', () => toggleHud());
+    head.querySelector('#bb-close-btn').addEventListener('click', () => setPanelOpen(false));
+    panel.appendChild(head);
+
+    statusEl = document.createElement('div');
+    statusEl.id = 'bb-status';
+    panel.appendChild(statusEl);
+
+    const tabDefs = [
+      ['uploads', 'Uploads'],
+      ['players', 'Players'],
+      ['chat', 'Chat'],
+      ['log', 'Log'],
+      ['settings', 'Settings'],
+    ];
+    tabsEl = document.createElement('div');
+    tabsEl.id = 'bb-tabs';
+    tabsEl.innerHTML = tabDefs.map(([key, label]) =>
+      `<button class="bb-tab" data-tab="${key}">${label}<span class="bb-tab-badge" data-badge="${key}" hidden></span></button>`
+    ).join('');
+    tabsEl.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.bb-tab');
+      if (btn) setTab(btn.dataset.tab);
+    });
+    panel.appendChild(tabsEl);
+
+    toolbarEl = document.createElement('div');
+    toolbarEl.id = 'bb-toolbar';
+    toolbarEl.innerHTML = `
+      <input id="bb-search" type="search" placeholder="filter by name or file…" autocomplete="off" />
+      <select id="bb-sort" title="sort uploads">
+        <option value="time">upload order</option>
+        <option value="rating">rating</option>
+        <option value="name">name</option>
+        <option value="size">size</option>
+      </select>
+    `;
+    searchInput = toolbarEl.querySelector('#bb-search');
+    sortSelect = toolbarEl.querySelector('#bb-sort');
+    sortSelect.value = STATE.ui.sort;
+    searchInput.addEventListener('input', () => {
+      uiQuery = searchInput.value;
+      renderPanel();
+    });
+    sortSelect.addEventListener('change', () => {
+      STATE.ui.sort = sortSelect.value;
+      saveUiPrefs();
+      renderPanel();
+    });
+    panel.appendChild(toolbarEl);
+
+    viewsEl = document.createElement('div');
+    viewsEl.id = 'bb-views';
+    tabDefs.forEach(([key]) => {
+      const view = document.createElement('div');
+      view.className = 'bb-view';
+      view.dataset.view = key;
+      viewEls[key] = view;
+      viewsEl.appendChild(view);
+    });
+    panel.appendChild(viewsEl);
+
+    listEl = document.createElement('div');
+    viewEls.uploads.appendChild(listEl);
+
+    membersEl = document.createElement('div');
+    membersEl.id = 'bb-members';
+    viewEls.players.appendChild(membersEl);
+
+    chatEl = document.createElement('div');
+    chatEl.id = 'bb-chat';
+    chatEl.innerHTML = `
+      <div class="bb-section-title" id="bb-chat-title">Chat</div>
+      <div id="bb-chat-top"></div>
+      <div id="bb-chat-log"></div>
+    `;
+    chatCopyBtn = document.createElement('button');
+    chatCopyBtn.id = 'bb-chat-copy-btn';
+    chatCopyBtn.textContent = 'copy chat log';
+    chatCopyBtn.style.marginTop = '8px';
+    chatCopyBtn.addEventListener('click', copyChatReport);
+    chatEl.appendChild(chatCopyBtn);
+    chatLogEl = chatEl.querySelector('#bb-chat-log');
+    viewEls.chat.appendChild(chatEl);
+
+    resultsEl = document.createElement('div');
+    resultsEl.id = 'bb-results';
+    viewEls.log.appendChild(resultsEl);
+
+    kickHistEl = document.createElement('div');
+    kickHistEl.id = 'bb-kick-history';
+    viewEls.log.appendChild(kickHistEl);
+
+    joinedMembersEl = document.createElement('div');
+    joinedMembersEl.id = 'bb-joined-members';
+    viewEls.log.appendChild(joinedMembersEl);
+
+    leftMembersEl = document.createElement('div');
+    leftMembersEl.id = 'bb-left-members';
+    viewEls.log.appendChild(leftMembersEl);
 
     const webhookWrap = document.createElement('div');
     webhookWrap.id = 'bb-webhook-wrap';
@@ -1139,7 +1391,7 @@
       const val = webhookInput.value.trim();
       STATE.webhookUrl = val;
       setWebhookUrl(val);
-      webhookSaveBtn.textContent = 'saved!';
+      webhookSaveBtn.textContent = 'saved';
       webhookSaveBtn.classList.add('bb-copied');
       setTimeout(() => {
         webhookSaveBtn.textContent = 'save webhook';
@@ -1147,16 +1399,14 @@
       }, 1200);
     });
     webhookWrap.appendChild(webhookSaveBtn);
-    panel.appendChild(webhookWrap);
+    viewEls.settings.appendChild(webhookWrap);
 
-    const toastWrapUI = document.createElement('div');
-    toastWrapUI.id = 'bb-toast-wrap';
-    toastWrapUI.style.cssText = 'border-bottom:1px solid var(--bb2-border);padding-bottom:9px;margin-bottom:9px;';
+    const toastPrefs = document.createElement('div');
     const toastDefs = [
       ['votes', 'ratings'], ['kicks', 'kick votes'], ['uploads', 'uploads'],
       ['joins', 'joins'], ['left', 'leaves'], ['results', 'results'],
     ];
-    toastWrapUI.innerHTML = `
+    toastPrefs.innerHTML = `
       <div class="bb-section-title">On-screen toasts</div>
       <div class="bb-toggle-grid">
         ${toastDefs.map(([key, label]) => `
@@ -1166,75 +1416,60 @@
           </label>
         `).join('')}
       </div>
+      <label class="bb-webhook-toggle">
+        <input type="checkbox" id="bb-sound-toggle" ${STATE.ui.sound ? 'checked' : ''} />
+        play a short cue on uploads and results
+      </label>
     `;
-    toastWrapUI.querySelectorAll('input[data-toast-key]').forEach((cb) => {
+    toastPrefs.querySelectorAll('input[data-toast-key]').forEach((cb) => {
       cb.addEventListener('change', () => {
         STATE.toastToggles[cb.dataset.toastKey] = cb.checked;
         setToastToggles(STATE.toastToggles);
       });
     });
-    hudShowBtn = document.createElement('button');
-    hudShowBtn.id = 'bb-hud-show-btn';
-    hudShowBtn.textContent = STATE.hud.hidden ? 'show score HUD' : 'hide score HUD';
-    hudShowBtn.addEventListener('click', () => toggleHud());
-    toastWrapUI.appendChild(hudShowBtn);
-    panel.appendChild(toastWrapUI);
+    toastPrefs.querySelector('#bb-sound-toggle').addEventListener('change', (ev) => {
+      STATE.ui.sound = ev.target.checked;
+      saveUiPrefs();
+      if (STATE.ui.sound) playCue(660, 120);
+    });
+    viewEls.settings.appendChild(toastPrefs);
 
+    const exportWrap = document.createElement('div');
+    exportWrap.innerHTML = '<div class="bb-section-title">Export</div>';
+    const btnRow = document.createElement('div');
+    btnRow.className = 'bb-btn-row';
     copyBtn = document.createElement('button');
     copyBtn.id = 'bb-copy-btn';
-    copyBtn.textContent = 'copy all as text';
+    copyBtn.textContent = 'copy report';
     copyBtn.addEventListener('click', copyReport);
-    panel.appendChild(copyBtn);
+    btnRow.appendChild(copyBtn);
+    downloadBtn = document.createElement('button');
+    downloadBtn.id = 'bb-download-btn';
+    downloadBtn.textContent = 'download .txt';
+    downloadBtn.addEventListener('click', downloadReport);
+    btnRow.appendChild(downloadBtn);
+    exportWrap.appendChild(btnRow);
+    viewEls.settings.appendChild(exportWrap);
 
-    statusEl = document.createElement('div');
-    statusEl.id = 'bb-status';
-    panel.appendChild(statusEl);
-
-    membersEl = document.createElement('div');
-    membersEl.id = 'bb-members';
-    panel.appendChild(membersEl);
-
-    resultsEl = document.createElement('div');
-    resultsEl.id = 'bb-results';
-    panel.appendChild(resultsEl);
-
-    joinedMembersEl = document.createElement('div');
-    joinedMembersEl.id = 'bb-joined-members';
-    panel.appendChild(joinedMembersEl);
-
-    leftMembersEl = document.createElement('div');
-    leftMembersEl.id = 'bb-left-members';
-    panel.appendChild(leftMembersEl);
-
-    kickHistEl = document.createElement('div');
-    kickHistEl.id = 'bb-kick-history';
-    panel.appendChild(kickHistEl);
-
-    listEl = document.createElement('div');
-    panel.appendChild(listEl);
-
-    chatEl = document.createElement('div');
-    chatEl.id = 'bb-chat';
-    chatEl.innerHTML = `
-      <div class="bb-section-title" id="bb-chat-title">Chat</div>
-      <div id="bb-chat-top"></div>
-      <div id="bb-chat-log"></div>
+    const keysWrap = document.createElement('div');
+    keysWrap.innerHTML = `
+      <div class="bb-section-title">Shortcuts</div>
+      <div class="bb-keys">
+        <span><kbd>alt</kbd>+<kbd>B</kbd> panel</span>
+        <span><kbd>alt</kbd>+<kbd>H</kbd> HUD</span>
+        <span><kbd>alt</kbd>+<kbd>C</kbd> collapse HUD</span>
+        <span><kbd>/</kbd> filter</span>
+        <span><kbd>esc</kbd> close</span>
+      </div>
     `;
-    chatCopyBtn = document.createElement('button');
-    chatCopyBtn.id = 'bb-chat-copy-btn';
-    chatCopyBtn.textContent = 'copy chat log';
-    chatCopyBtn.style.marginTop = '6px';
-    chatCopyBtn.addEventListener('click', copyChatReport);
-    chatEl.appendChild(chatCopyBtn);
-    chatLogEl = chatEl.querySelector('#bb-chat-log');
-    panel.appendChild(chatEl);
+    viewEls.settings.appendChild(keysWrap);
 
     const credits = document.createElement('div');
     credits.id = 'bb-credits';
     credits.innerHTML = `made by @alshailopezstein96 on Discord`
       + `<br><a href="https://github.com/FaithfullyOSS/BeatBattleX" target="_blank" rel="noopener noreferrer">github.com/FaithfullyOSS/BeatBattleX</a>`
       + `<br><a class="bb-discord-cta" href="${DISCORD_INVITE}" target="_blank" rel="noopener noreferrer">join our Discord</a>`;
-    panel.appendChild(credits);
+    viewEls.settings.appendChild(credits);
 
     hudEl = document.createElement('div');
     hudEl.id = 'bb-hud';
@@ -1278,11 +1513,33 @@
 
     window.addEventListener('resize', applyHudPosition);
     window.addEventListener('keydown', (ev) => {
-      if (!ev.altKey || ev.ctrlKey || ev.metaKey) return;
+      if (ev.ctrlKey || ev.metaKey) return;
       const t = ev.target;
-      if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''))) return;
+      const typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ''));
       const key = (ev.key || '').toLowerCase();
-      if (key === 'b') { panel.classList.toggle('open'); ev.preventDefault(); }
+
+      if (key === 'escape' && STATE.ui.open) {
+        if (typing && t === searchInput && searchInput.value) {
+          searchInput.value = '';
+          uiQuery = '';
+          renderPanel();
+        } else {
+          setPanelOpen(false);
+        }
+        ev.preventDefault();
+        return;
+      }
+      if (typing) return;
+      if (key === '/' && !ev.altKey) {
+        if (!STATE.ui.open) setPanelOpen(true);
+        setTab('uploads');
+        searchInput.focus();
+        searchInput.select();
+        ev.preventDefault();
+        return;
+      }
+      if (!ev.altKey) return;
+      if (key === 'b') { setPanelOpen(!STATE.ui.open); ev.preventDefault(); }
       else if (key === 'h') { toggleHud(); ev.preventDefault(); }
       else if (key === 'c') {
         STATE.hud.collapsed = !STATE.hud.collapsed;
@@ -1292,14 +1549,183 @@
       }
     });
 
+    syncChrome();
+
     setInterval(() => {
       if (STATE.room) renderStatus();
     }, 1000);
+
+    // Relative timestamps in the log tab go stale on their own.
+    setInterval(() => {
+      if (STATE.ui.open && STATE.ui.tab === 'log') {
+        renderJoinedMembers();
+        renderLeftMembers();
+        renderKickHistory();
+      }
+    }, 20000);
+  }
+
+  function saveUiPrefs() {
+    setJsonSetting(LS_UI_KEY, STATE.ui);
+  }
+
+  function setPanelOpen(open) {
+    STATE.ui.open = !!open;
+    saveUiPrefs();
+    syncChrome();
+    if (STATE.ui.open) renderPanel();
+  }
+
+  function setTab(name) {
+    if (!viewEls[name]) return;
+    STATE.ui.tab = name;
+    saveUiPrefs();
+    syncChrome();
+    renderPanel();
+    if (name === 'chat') renderChat();
+  }
+
+  // Everything that is chrome rather than data: open state, active tab, the
+  // toggle states in the header. Cheap enough to run on any state change.
+  function syncChrome() {
+    if (!panel) return;
+    panel.classList.toggle('open', !!STATE.ui.open);
+    if (muteBtn) {
+      muteBtn.textContent = STATE.ui.muted ? 'muted' : 'toasts';
+      muteBtn.classList.toggle('bb-on', !STATE.ui.muted);
+      muteBtn.title = STATE.ui.muted ? 'toasts muted — click to unmute' : 'toasts on — click to mute';
+    }
+    if (hudShowBtn) {
+      hudShowBtn.classList.toggle('bb-on', !STATE.hud.hidden);
+      hudShowBtn.title = STATE.hud.hidden ? 'show score HUD (alt+H)' : 'hide score HUD (alt+H)';
+    }
+    if (tabsEl) {
+      tabsEl.querySelectorAll('.bb-tab').forEach((btn) => {
+        btn.classList.toggle('bb-active', btn.dataset.tab === STATE.ui.tab);
+      });
+    }
+    Object.keys(viewEls).forEach((key) => { viewEls[key].hidden = key !== STATE.ui.tab; });
+    if (toolbarEl) toolbarEl.hidden = STATE.ui.tab !== 'uploads';
+  }
+
+  function setBadge(key, value) {
+    if (!tabsEl) return;
+    const el = tabsEl.querySelector(`[data-badge="${key}"]`);
+    if (!el) return;
+    el.textContent = value == null ? '' : String(value);
+    el.hidden = value == null;
+  }
+
+  function timeAgo(value) {
+    const t = new Date(value).getTime();
+    if (!t) return '';
+    const secs = Math.max(0, (Date.now() - t) / 1000);
+    if (secs < 45) return 'just now';
+    if (secs < 5400) return Math.max(1, Math.round(secs / 60)) + 'm ago';
+    return Math.round(secs / 3600) + 'h ago';
+  }
+
+  function copyText(text, el) {
+    const flash = () => {
+      if (!el) return;
+      el.classList.add('bb-copied-flash');
+      setTimeout(() => el.classList.remove('bb-copied-flash'), 700);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(flash, () => fallbackCopy(text, flash));
+    } else {
+      fallbackCopy(text, flash);
+    }
+  }
+
+  function downloadReport() {
+    const room = STATE.room;
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T-]/g, '');
+    const name = `beatbattle-${(room && (room.code || room.id)) || 'room'}-${stamp}.txt`;
+    try {
+      const blob = new Blob([buildReportText()], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = name;
+      document.documentElement.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      flashBtn(downloadBtn, 'saved', 'download .txt');
+    } catch (e) {
+      console.error('[BB overlay] download failed', e);
+      flashBtn(downloadBtn, 'failed', 'download .txt');
+    }
+  }
+
+  function flashBtn(btn, tempText, restoreText) {
+    if (!btn) return;
+    btn.textContent = tempText;
+    btn.classList.add('bb-copied');
+    setTimeout(() => {
+      btn.textContent = restoreText;
+      btn.classList.remove('bb-copied');
+    }, 1400);
+  }
+
+  // Short WebAudio blip. Opt-in, and deliberately quiet - this runs on a page
+  // the user is already listening to.
+  let audioCtx = null;
+  function playCue(freq, ms) {
+    if (!STATE.ui.sound) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      audioCtx = audioCtx || new Ctx();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const t0 = audioCtx.currentTime;
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.05, t0 + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + ms / 1000);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + ms / 1000);
+    } catch (e) {}
+  }
+
+  function entryMatches(entry, query) {
+    if (!query) return true;
+    const q = query.toLowerCase();
+    return (entry.displayName || '').toLowerCase().indexOf(q) !== -1
+      || (entry.name || '').toLowerCase().indexOf(q) !== -1
+      || (entry.fileName || '').toLowerCase().indexOf(q) !== -1;
+  }
+
+  function sortEntries(entries, mode) {
+    const list = entries.slice();
+    if (mode === 'name') {
+      return list.sort((a, b) => a.displayName.localeCompare(b.displayName));
+    }
+    if (mode === 'size') {
+      return list.sort((a, b) => (b.byteSize || 0) - (a.byteSize || 0));
+    }
+    if (mode === 'rating') {
+      return list.sort((a, b) => {
+        const av = a.expectedVotes && a.score != null ? a.score / a.expectedVotes : null;
+        const bv = b.expectedVotes && b.score != null ? b.score / b.expectedVotes : null;
+        if (av == null && bv == null) return a.displayName.localeCompare(b.displayName);
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        return bv - av;
+      });
+    }
+    return list; // 'time' - STATE.entries is already in upload order
   }
 
   function toggleHud(forceHide) {
     STATE.hud.hidden = forceHide === true ? true : !STATE.hud.hidden;
     saveHudPrefs();
+    syncChrome();
     renderHud();
   }
 
@@ -1368,7 +1794,6 @@
   function renderHud() {
     if (!hudEl) return;
     const room = STATE.room;
-    if (hudShowBtn) hudShowBtn.textContent = STATE.hud.hidden ? 'show score HUD' : 'hide score HUD';
     const visible = !!room && !STATE.hud.hidden;
     hudEl.classList.toggle('bb-hud-on', visible);
     hudEl.classList.toggle('bb-collapsed', !!STATE.hud.collapsed);
@@ -1385,7 +1810,7 @@
     const metaBits = [`${room.name || '?'} [${room.code || '?'}]`];
     if (room.stageStartedAt && room.stageDurationSeconds) {
       const remaining = (new Date(room.stageStartedAt).getTime() + room.stageDurationSeconds * 1000 - now) / 1000;
-      metaBits.push(`<span class="bb-hud-timer">${fmtClock(remaining)}</span>`);
+      metaBits.push(`<span class="bb-hud-timer${remaining <= 30 ? ' bb-urgent' : ''}">${fmtClock(remaining)}</span>`);
     }
     hudMetaEl.innerHTML = escapeHtml(metaBits[0]) + (metaBits[1] ? ' &middot; ' + metaBits[1] : '');
 
@@ -1404,8 +1829,8 @@
     const ranked = STATE.entries
       .slice()
       .sort((a, b) => {
-        const av = a.voteCount ? a.score / a.voteCount : null;
-        const bv = b.voteCount ? b.score / b.voteCount : null;
+        const av = a.expectedVotes ? a.score / a.expectedVotes : null;
+        const bv = b.expectedVotes ? b.score / b.expectedVotes : null;
         if (av == null && bv == null) {
           if (a.hasUploaded !== b.hasUploaded) return a.hasUploaded ? -1 : 1;
           return a.displayName.localeCompare(b.displayName);
@@ -1417,7 +1842,7 @@
       });
 
     hudRowsEl.innerHTML = ranked.map((e, i) => {
-      const avg = formatAvgRating(e.score, e.voteCount);
+      const avg = formatAvgRating(e.score, e.expectedVotes);
       const rating = avg == null ? null : Number(avg);
       const tone = toneForRating(rating);
       const pct = rating == null ? 0 : clamp(((rating - 1) / 4) * 100, 0, 100);
@@ -1445,43 +1870,88 @@
     }).join('');
   }
 
-  const TOAST_MAX = 5;
-  const TOAST_TTL_MS = 6000;
+  const TOAST_MAX = 6;
+  const TOAST_TTL_MS = 9000;
+  const VOTE_TOAST_TTL_MS = 14000;
+  const TOAST_MIN_VISIBLE_MS = 2500;
   const activeToasts = [];
+  let toastTrimTimer = null;
+
+  function trimToasts() {
+    clearTimeout(toastTrimTimer);
+    toastTrimTimer = null;
+    const now = Date.now();
+    while (activeToasts.length > TOAST_MAX) {
+      const oldest = activeToasts[0];
+      const age = now - oldest.shownAt;
+      if (oldest.paused || age < TOAST_MIN_VISIBLE_MS) {
+        toastTrimTimer = setTimeout(trimToasts, TOAST_MIN_VISIBLE_MS - age);
+        return;
+      }
+      dismissToast(oldest);
+    }
+  }
 
   function toast(kind, title, body, opts) {
     const o = opts || {};
     if (kind && !STATE.toastToggles[kind]) return;
+    if (STATE.ui.muted) return;
     ensureUI();
     if (!toastWrap) return;
 
     const key = o.key || `${kind}|${title}|${body || ''}`;
     const existing = activeToasts.find((t) => t.key === key);
     if (existing) {
-      existing.count += 1;
-      const badge = existing.el.querySelector('.bb-toast-count');
-      badge.textContent = '\u00d7' + existing.count;
-      badge.hidden = false;
+      if (o.replace) {
+        existing.el.className = 'bb-toast bb-tone-' + (o.tone || 'info');
+        existing.el.innerHTML = toastInnerHtml(title, body, o);
+        existing.count = 1;
+        existing.el.classList.remove('bb-toast-bump');
+        void existing.el.offsetWidth;
+        existing.el.classList.add('bb-toast-bump');
+      } else {
+        existing.count += 1;
+        const badge = existing.el.querySelector('.bb-toast-count');
+        badge.textContent = '\u00d7' + existing.count;
+        badge.hidden = false;
+      }
       clearTimeout(existing.timer);
-      existing.timer = setTimeout(() => dismissToast(existing), o.ttl || TOAST_TTL_MS);
+      existing.ttl = o.ttl || TOAST_TTL_MS;
+      existing.expiresAt = Date.now() + existing.ttl;
+      if (!existing.paused) existing.timer = setTimeout(() => dismissToast(existing), existing.ttl);
       return;
     }
 
     const el = document.createElement('div');
     el.className = 'bb-toast bb-tone-' + (o.tone || 'info');
-    el.innerHTML = `
+    el.innerHTML = toastInnerHtml(title, body, o);
+    const ttl = o.ttl || TOAST_TTL_MS;
+    const entry = { el, key, count: 1, timer: null, shownAt: Date.now(), ttl, expiresAt: Date.now() + ttl, paused: false };
+    el.addEventListener('click', () => dismissToast(entry));
+    // Hovering holds a toast open, so a long one can actually be read.
+    el.addEventListener('mouseenter', () => {
+      entry.paused = true;
+      clearTimeout(entry.timer);
+    });
+    el.addEventListener('mouseleave', () => {
+      entry.paused = false;
+      entry.expiresAt = Math.max(entry.expiresAt, Date.now() + 1200);
+      entry.timer = setTimeout(() => dismissToast(entry), entry.expiresAt - Date.now());
+    });
+    toastWrap.appendChild(el);
+    activeToasts.push(entry);
+    trimToasts();
+    entry.timer = setTimeout(() => dismissToast(entry), ttl);
+  }
+
+  function toastInnerHtml(title, body, o) {
+    return `
       ${o.avatarUrl ? `<img class="bb-toast-av" src="${escapeAttr(o.avatarUrl)}" alt="" loading="lazy" />` : ''}
       <div class="bb-toast-text">
         <div class="bb-toast-title">${escapeHtml(title)}<span class="bb-toast-count" hidden></span></div>
         ${body ? `<div class="bb-toast-body">${o.bodyHtml ? body : escapeHtml(body)}</div>` : ''}
       </div>
     `;
-    const entry = { el, key, count: 1, timer: null };
-    el.addEventListener('click', () => dismissToast(entry));
-    toastWrap.appendChild(el);
-    activeToasts.push(entry);
-    while (activeToasts.length > TOAST_MAX) dismissToast(activeToasts[0]);
-    entry.timer = setTimeout(() => dismissToast(entry), o.ttl || TOAST_TTL_MS);
   }
 
   function dismissToast(entry) {
@@ -1489,24 +1959,53 @@
     if (i === -1) return;
     activeToasts.splice(i, 1);
     clearTimeout(entry.timer);
+    if (activeToasts.length <= TOAST_MAX) {
+      clearTimeout(toastTrimTimer);
+      toastTrimTimer = null;
+    }
     entry.el.classList.add('bb-toast-out');
     setTimeout(() => entry.el.remove(), 200);
   }
 
-  function toastRatingVote(voterId, vote) {
-    const rating = ratingFor(vote.score);
+  function toastRatingVote(ev) {
+    const rating = ratingFor(ev.score);
     const tone = toneForRating(rating);
-    toast('votes', `${nameFor(voterId)} rated ${nameFor(vote.targetId)}`,
-      `<span class="bb-toast-stars bb-tone-${tone}">${starsFor(rating)}</span> ${rating}/5`,
+    const changed = ev.prevScore != null;
+    const was = changed ? `<span class="bb-tone-mute">${ratingFor(ev.prevScore)}/5 &rarr;</span> ` : '';
+    toast('votes',
+      `${nameFor(ev.voterId)} ${changed ? 're-rated' : 'rated'} ${nameFor(ev.targetId)}`,
+      `<span class="bb-toast-stars bb-tone-${tone}">${starsFor(rating)}</span> ${was}${rating}/5`,
       {
         tone,
         bodyHtml: true,
+        replace: true,
+        ttl: VOTE_TOAST_TTL_MS,
+        avatarUrl: avatarForUser(ev.voterId),
+        key: `vote|${ev.voterId}|${ev.targetId}`,
+      });
+  }
+
+  function toastRatingBatch(voterId, list) {
+    const avgRating = list.reduce((sum, ev) => sum + ratingFor(ev.score), 0) / list.length;
+    const shown = list.slice(0, 4).map((ev) => {
+      const rating = ratingFor(ev.score);
+      return `${escapeHtml(nameFor(ev.targetId))} <span class="bb-tone-${toneForRating(rating)}">${rating}/5</span>`;
+    });
+    const more = list.length > shown.length ? ` <span class="bb-tone-mute">+${list.length - shown.length} more</span>` : '';
+    toast('votes', `${nameFor(voterId)} rated ${list.length} beats`,
+      shown.join(' \u00b7 ') + more,
+      {
+        tone: toneForRating(avgRating),
+        bodyHtml: true,
+        replace: true,
+        ttl: VOTE_TOAST_TTL_MS,
         avatarUrl: avatarForUser(voterId),
-        key: `vote|${voterId}|${vote.targetId}`,
+        key: `votebatch|${voterId}`,
       });
   }
 
   function toastUpload(entry) {
+    playCue(660, 130);
     toast('uploads', `${entry.displayName} uploaded`, entry.fileName || 'a beat', {
       tone: 'good',
       avatarUrl: avatarForUser(entry.userId),
@@ -1548,40 +2047,50 @@
   function renderStatus() {
     ensureUI();
     renderHud();
+    updateConnectionDot();
     const room = STATE.room;
     if (!room) {
       statusEl.innerHTML = '';
+      if (headRoomEl) headRoomEl.textContent = 'no room';
       return;
     }
     injectNowPlayingCredit();
     const now = Date.now();
-    const lines = [];
+    if (headRoomEl) headRoomEl.textContent = room.code ? '#' + room.code : '';
 
-    lines.push('<div class="bb-section-title">Game info</div>');
-    lines.push(`<div class="bb-status-line">${escapeHtml(room.name || '?')} [${escapeHtml(room.code || '?')}]</div>`);
-    lines.push(`<div class="bb-status-line bb-meta">${escapeHtml(room.genre || '?')} · ${escapeHtml(room.matchMode || '?')} · ${escapeHtml(room.gameplayMode || '?')} · ${escapeHtml(room.visibility || '?')}</div>`);
-    lines.push(`<div class="bb-status-line bb-meta">players: ${room.memberCount != null ? room.memberCount : (room.members || []).length}/${room.maxPlayers || '?'} · timer: ${room.timerMinutes != null ? room.timerMinutes + 'm' : '?'} · host: ${escapeHtml((room.host && room.host.displayName) || '?')}</div>`);
-    if (room.kitSeed != null) {
-      lines.push(`<div class="bb-status-line bb-meta">kit seed: ${escapeHtml(String(room.kitSeed))}</div>`);
+    const lines = [];
+    lines.push(`<div class="bb-room-line">
+      <span class="bb-room-name">${escapeHtml(room.name || 'untitled room')}</span>
+      <span class="bb-room-code">${escapeHtml(room.code || '?')}</span>
+      <span class="bb-pill">${escapeHtml(room.phase || '?')} / ${escapeHtml(room.gameState || '?')}</span>
+    </div>`);
+
+    const facts = [
+      ['players', `${room.memberCount != null ? room.memberCount : (room.members || []).length}/${room.maxPlayers || '?'}`],
+      ['genre', room.genre || '?'],
+      ['mode', `${room.matchMode || '?'} / ${room.gameplayMode || '?'}`],
+      ['timer', room.timerMinutes != null ? room.timerMinutes + 'm' : '?'],
+      ['host', (room.host && room.host.displayName) || '?'],
+    ];
+    if (room.visibility) facts.push(['visibility', room.visibility]);
+    if (room.kitSeed != null) facts.push(['kit seed', String(room.kitSeed)]);
+    lines.push(`<div class="bb-facts">${facts.map(([label, value]) =>
+      `<span class="bb-fact">${escapeHtml(label)} <b>${escapeHtml(String(value))}</b></span>`).join('')}</div>`);
+
+    if (room.creativeBrief) {
+      lines.push(`<div class="bb-note bb-meta">brief: ${escapeHtml(room.creativeBrief)}</div>`);
     }
     if (room.sharedKit != null) {
-      lines.push(`<div class="bb-status-line bb-meta">shared kit: ${escapeHtml(JSON.stringify(room.sharedKit).slice(0, 200))}</div>`);
-    }
-    if (room.creativeBrief) {
-      lines.push(`<div class="bb-status-line bb-meta">brief: ${escapeHtml(room.creativeBrief)}</div>`);
-    }
-
-    lines.push('<div class="bb-section-title">Status</div>');
-    lines.push(`<div class="bb-status-line bb-phase">phase: ${escapeHtml(room.phase || '?')} / ${escapeHtml(room.gameState || '?')}</div>`);
-
-    if (room.votingSkipRequestedUserIds && room.votingSkipRequestedUserIds.length) {
-      const total = (room.members || []).length;
-      lines.push(`<div class="bb-status-line bb-meta">skip vote requested: ${room.votingSkipRequestedUserIds.length}/${total}</div>`);
+      lines.push(`<div class="bb-note bb-meta">shared kit: ${escapeHtml(JSON.stringify(room.sharedKit).slice(0, 140))}</div>`);
     }
 
     if (room.stageStartedAt && room.stageDurationSeconds) {
       const remaining = (new Date(room.stageStartedAt).getTime() + room.stageDurationSeconds * 1000 - now) / 1000;
-      lines.push(`<div class="bb-status-line bb-timer">stage timer: ${fmtClock(remaining)}</div>`);
+      lines.push(`<div class="bb-note">stage <span class="bb-timer${remaining <= 30 ? ' bb-urgent' : ''}">${fmtClock(remaining)}</span></div>`);
+    }
+
+    if (room.votingSkipRequestedUserIds && room.votingSkipRequestedUserIds.length) {
+      lines.push(`<div class="bb-note bb-meta">skip requested by ${room.votingSkipRequestedUserIds.length}/${(room.members || []).length}</div>`);
     }
 
     if (room.gameState === 'showcase' && room.showcaseSchedule && room.showcaseSchedule.entries) {
@@ -1591,13 +2100,13 @@
       if (cur) {
         const remaining = (cur.playAtMs + cur.durationMs - now) / 1000;
         const skipVotes = (room.showcaseSkipVotesByEntryUserId || {})[cur.userId];
-        const skipNote = skipVotes && skipVotes.length ? ` (skip votes: ${skipVotes.length})` : '';
-        lines.push(`<div class="bb-status-line bb-playing">now playing: ${escapeHtml(nameFor(cur.userId))} (${fmtClock(remaining)} left)${skipNote}</div>`);
+        const skipNote = skipVotes && skipVotes.length ? ` <span class="bb-meta">(${skipVotes.length} skip votes)</span>` : '';
+        lines.push(`<div class="bb-note bb-playing">now playing <b>${escapeHtml(nameFor(cur.userId))}</b> <span class="bb-timer">${fmtClock(remaining)}</span>${skipNote}</div>`);
       } else {
         const next = room.showcaseSchedule.entries.find((en) => en.playAtMs > now);
         if (next) {
           const until = (next.playAtMs - now) / 1000;
-          lines.push(`<div class="bb-status-line bb-playing">next up: ${escapeHtml(nameFor(next.userId))} in ${fmtClock(until)}</div>`);
+          lines.push(`<div class="bb-note bb-playing">next up <b>${escapeHtml(nameFor(next.userId))}</b> in <span class="bb-timer">${fmtClock(until)}</span></div>`);
         }
       }
       checkNowPlaying(room, cur);
@@ -1607,9 +2116,8 @@
       const kv = room.activeKickVote;
       const remaining = (new Date(kv.expiresAt).getTime() - now) / 1000;
       if (remaining > 0) {
-        const voters = kv.voterUserIds.map(nameFor).join(', ');
-        lines.push(`<div class="bb-status-line bb-kick">kick vote: ${escapeHtml(nameFor(kv.targetUserId))}, started by ${escapeHtml(nameFor(kv.initiatedByUserId))}, ${fmtClock(remaining)} left</div>`);
-        lines.push(`<div class="bb-status-line bb-kick">voters (${kv.voterUserIds.length}): ${escapeHtml(voters)}</div>`);
+        lines.push(`<div class="bb-note bb-kick">kick vote on <b>${escapeHtml(nameFor(kv.targetUserId))}</b> by ${escapeHtml(nameFor(kv.initiatedByUserId))} <span class="bb-timer">${fmtClock(remaining)}</span></div>`);
+        lines.push(`<div class="bb-note bb-meta">${kv.voterUserIds.length} voted: ${escapeHtml(kv.voterUserIds.map(nameFor).join(', '))}</div>`);
       }
     }
 
@@ -1617,6 +2125,23 @@
     renderMembers();
     renderResults();
     renderKickHistory();
+  }
+
+  function updateConnectionDot() {
+    if (!toggleDotEl) return;
+    const age = STATE.lastMsgAt ? Date.now() - STATE.lastMsgAt : Infinity;
+    toggleDotEl.classList.toggle('bb-live', age < 20000);
+    toggleDotEl.classList.toggle('bb-stale', age >= 20000 && age < 120000);
+    toggleBtn.title = STATE.lastMsgAt
+      ? 'last room update ' + timeAgo(STATE.lastMsgAt) + ' — alt+B'
+      : 'waiting for the room socket — alt+B';
+  }
+
+  function wireCopyNames(root) {
+    root.querySelectorAll('.bb-name[data-copy]').forEach((el) => {
+      el.title = 'click to copy';
+      el.addEventListener('click', () => copyText(el.dataset.copy, el));
+    });
   }
 
   function checkNowPlaying(room, cur) {
@@ -1635,18 +2160,24 @@
     }
     const kickCounts = room.kickInitiationCountByUserId || {};
     const forfeitedIds = new Set(room.forfeitedUserIds || []);
-    const rows = room.members
-      .map((m) => {
-        const kicksInit = kickCounts[m.userId];
-        const kickNote = kicksInit ? ` <span class="bb-meta">(started ${kicksInit} kick vote${kicksInit === 1 ? '' : 's'})</span>` : '';
-        const forfeitNote = forfeitedIds.has(m.userId) ? ' <span class="bb-dupe">[forfeited]</span>' : '';
-        return `<div class="bb-member-row">
-          <span class="${m.isReady ? 'bb-ready' : 'bb-not-ready'}">${m.isReady ? 'ready' : 'not ready'}</span>
-          <span${nameStyleAttr(m.nameColorKey)}>${escapeHtml(m.displayName)}</span>${m.name ? ' (' + escapeHtml(m.name) + ')' : ''}${kickNote}${forfeitNote}
-        </div>`;
-      })
-      .join('');
-    membersEl.innerHTML = `<div class="bb-section-title">Members (${room.members.length})</div>${rows}`;
+    const uploadedIds = new Set(STATE.entries.filter((e) => e.hasUploaded).map((e) => e.userId));
+    const readyCount = room.members.filter((m) => m.isReady).length;
+
+    const rows = room.members.map((m) => {
+      const tags = [];
+      if (uploadedIds.has(m.userId)) tags.push('<span class="bb-tone-good">uploaded</span>');
+      if (forfeitedIds.has(m.userId)) tags.push('<span class="bb-tone-bad">forfeit</span>');
+      const kicksInit = kickCounts[m.userId];
+      if (kicksInit) tags.push(`<span class="bb-tone-warn">${kicksInit} kick${kicksInit === 1 ? '' : 's'}</span>`);
+      return `<div class="bb-member-row">
+        <span class="bb-ready-dot${m.isReady ? ' bb-is-ready' : ''}" title="${m.isReady ? 'ready' : 'not ready'}"></span>
+        <span class="bb-name-cell"><span class="bb-name" data-copy="${escapeAttr(m.displayName)}"${nameStyleAttr(m.nameColorKey)}>${escapeHtml(m.displayName)}</span>${m.name ? ` <span class="bb-meta">${escapeHtml(m.name)}</span>` : ''}</span>
+        <span class="bb-member-tags">${tags.join('')}</span>
+      </div>`;
+    }).join('');
+
+    membersEl.innerHTML = `<div class="bb-section-title">Players <span class="bb-count">${readyCount}/${room.members.length} ready</span></div>${rows}`;
+    wireCopyNames(membersEl);
   }
 
   function renderKickHistory() {
@@ -1658,16 +2189,14 @@
     const rows = past
       .slice()
       .reverse()
-      .map((h) => {
-        const t = new Date(h.startedAt).toLocaleTimeString();
-        return `<div class="bb-kick-hist-entry">
-          <span class="bb-kick">${escapeHtml(h.targetName)}</span> [${escapeHtml(h.status)}]
-          started by ${escapeHtml(h.initiatorName)} at ${t}
-          <div class="bb-meta">voters (${h.voterUserIds.length}): ${escapeHtml(h.voterNames.join(', ') || 'none')}</div>
-        </div>`;
-      })
+      .map((h) => `<div class="bb-log-entry bb-log-kick">
+        <span class="bb-tone-warn">${escapeHtml(h.targetName)}</span>
+        <span class="bb-meta">${escapeHtml(h.status)}</span>
+        <div class="bb-when">started by ${escapeHtml(h.initiatorName)} ${timeAgo(h.startedAt)} &middot; ${h.voterUserIds.length} voted</div>
+        <div class="bb-meta">${escapeHtml(h.voterNames.join(', ') || 'no voters')}</div>
+      </div>`)
       .join('');
-    kickHistEl.innerHTML = `<div class="bb-section-title">Kick history (${past.length})</div>${rows}`;
+    kickHistEl.innerHTML = `<div class="bb-section-title">Kick votes <span class="bb-count">${past.length}</span></div>${rows}`;
   }
 
   function renderChat() {
@@ -1675,7 +2204,7 @@
     const msgs = STATE.chatMessages;
     const titleEl = chatEl.querySelector('#bb-chat-title');
     const topEl = chatEl.querySelector('#bb-chat-top');
-    titleEl.textContent = `Chat (${msgs.length})`;
+    titleEl.innerHTML = `Chat <span class="bb-count">${msgs.length}</span>`;
 
     if (!msgs.length) {
       topEl.innerHTML = '';
@@ -1744,57 +2273,75 @@
   function renderPanel(flash) {
     ensureUI();
     const uploadedCount = STATE.entries.filter((e) => e.hasUploaded).length;
-    toggleBtn.textContent = `uploads (${uploadedCount}/${STATE.entries.length})`;
+    if (toggleLabelEl) toggleLabelEl.textContent = `${uploadedCount}/${STATE.entries.length} uploads`;
     if (flash) {
       toggleBtn.classList.add('bb-flash');
-      setTimeout(() => { toggleBtn.classList.remove('bb-flash'); }, 600);
+      setTimeout(() => { toggleBtn.classList.remove('bb-flash'); }, 700);
     }
     renderStatus();
     renderJoinedMembers();
     renderLeftMembers();
-    listEl.innerHTML = '<div class="bb-section-title">Uploads</div>';
+
+    setBadge('uploads', STATE.entries.length ? `${uploadedCount}/${STATE.entries.length}` : null);
+    setBadge('players', (STATE.room && (STATE.room.members || []).length) || null);
+    setBadge('chat', STATE.chatMessages.length || null);
+    setBadge('log', (STATE.joinedMembers.length + STATE.leftMembers.length) || null);
+
+    const query = uiQuery.trim();
+    const visible = sortEntries(STATE.entries.filter((e) => entryMatches(e, query)), STATE.ui.sort);
+    const countLabel = query
+      ? `${visible.length} of ${STATE.entries.length}`
+      : `${uploadedCount}/${STATE.entries.length}`;
+    listEl.innerHTML = `<div class="bb-section-title">Uploads <span class="bb-count">${countLabel}</span></div>`;
 
     if (!STATE.entries.length) {
-      listEl.insertAdjacentHTML('beforeend', '<div class="bb-empty">no members yet</div>');
+      listEl.insertAdjacentHTML('beforeend', '<div class="bb-empty">no players yet</div>');
+      return;
+    }
+    if (!visible.length) {
+      listEl.insertAdjacentHTML('beforeend', `<div class="bb-empty">nothing matches ${escapeHtml(query)}</div>`);
       return;
     }
 
     const frag = document.createDocumentFragment();
-    STATE.entries.forEach((e) => {
+    visible.forEach((e) => {
       const row = document.createElement('div');
       row.className = 'bb-entry' + (e.hasUploaded ? '' : ' bb-no-upload') + (e.left ? ' bb-left' : '');
-      const leftTag = e.left ? ' <span class="bb-meta">[left room]</span>' : '';
-      const forfeitTag = e.forfeited ? ' <span class="bb-dupe">[forfeited]</span>' : '';
-      const nameHtml = `<span${nameStyleAttr(e.nameColorKey)}>${escapeHtml(e.displayName)}</span>`;
+      const tags = [];
+      if (e.left) tags.push('<span class="bb-meta">left</span>');
+      if (e.forfeited) tags.push('<span class="bb-tone-bad">forfeit</span>');
+      const nameHtml = `<span class="bb-name" data-copy="${escapeAttr(e.displayName)}"${nameStyleAttr(e.nameColorKey)}>${escapeHtml(e.displayName)}</span>`;
+      const whoHtml = `<div class="bb-who">${nameHtml}${e.name ? ` <span class="bb-meta">${escapeHtml(e.name)}</span>` : ''} ${tags.join(' ')}</div>`;
 
       if (!e.hasUploaded) {
-        row.innerHTML = `
-          <div class="bb-fn bb-meta">no upload yet</div>
-          <div class="bb-who">${nameHtml}${e.name ? ' (' + escapeHtml(e.name) + ')' : ''}${leftTag}${forfeitTag}</div>
-        `;
+        row.innerHTML = `${whoHtml}<div class="bb-fn bb-meta">no upload yet</div>`;
         frag.appendChild(row);
         return;
       }
 
       const sizeKb = e.byteSize ? Math.round(e.byteSize / 1024) : '?';
-      const avgRating = formatAvgRating(e.score, e.voteCount);
+      const avgRating = formatAvgRating(e.score, e.expectedVotes);
+      const rating = avgRating == null ? null : Number(avgRating);
       const scoreHtml = avgRating != null
-        ? `<span class="bb-score${Number(avgRating) < 3 ? ' neg' : ''}">${avgRating}/5 (${e.voteCount} vote${e.voteCount === 1 ? '' : 's'})</span>`
+        ? `<span class="bb-score${rating < 3 ? ' neg' : ''}">${avgRating}/5</span>
+           <span class="bb-meta bb-tone-${toneForRating(rating)}">${starsFor(rating)}</span>
+           <span class="bb-meta">${e.voteCount}/${e.expectedVotes} voted</span>`
         : '<span class="bb-meta">no votes yet</span>';
       const dupeHtml = e.dupeWith.length
-        ? `<div class="bb-dupe">dupe (same sha256) of: ${escapeHtml(e.dupeWith.join(', '))}</div>`
+        ? `<div class="bb-dupe">same sha256 as ${escapeHtml(e.dupeWith.join(', '))}</div>`
         : '';
       row.innerHTML = `
+        ${whoHtml}
         <div class="bb-fn">${escapeHtml(e.fileName)}</div>
-        <div class="bb-who">${nameHtml}${e.name ? ' (' + escapeHtml(e.name) + ')' : ''}${leftTag}${forfeitTag}</div>
-        <div class="bb-meta">${escapeHtml(e.mimeType || '')} · ${sizeKb}kb · ${e.durationSeconds ? Math.round(e.durationSeconds) + 's' : '?'} · ${e.downloadable ? 'downloadable' : 'stream-only'}</div>
+        <div class="bb-meta">${escapeHtml(e.mimeType || '?')} &middot; ${sizeKb} kb &middot; ${e.durationSeconds ? Math.round(e.durationSeconds) + 's' : '?'} &middot; ${e.downloadable ? 'downloadable' : 'stream only'}</div>
         <div>${scoreHtml}</div>
         ${dupeHtml}
-        <div><a href="${escapeAttr(e.playbackUrl)}" target="_blank" rel="noopener noreferrer">playback</a></div>
+        <div><a href="${escapeAttr(e.playbackUrl)}" target="_blank" rel="noopener noreferrer">open playback</a></div>
       `;
       frag.appendChild(row);
     });
     listEl.appendChild(frag);
+    wireCopyNames(listEl);
   }
 
   function renderResults() {
@@ -1810,15 +2357,21 @@
       .sort((a, b) => (b.score || 0) - (a.score || 0));
     const rows = ranked
       .map((e, i) => {
-        const avgRating = formatAvgRating(e.score, e.voteCount);
-        return `<div class="bb-result-row"><span class="bb-rank">#${i + 1}</span> ${escapeHtml(e.displayName)} - ${escapeHtml(e.fileName)} - ${avgRating != null ? `${avgRating}/5` : 'no votes'} (${e.voteCount} votes)</div>`;
+        const avgRating = formatAvgRating(e.score, e.expectedVotes);
+        const tone = toneForRating(avgRating == null ? null : Number(avgRating));
+        return `<div class="bb-result-row${i === 0 ? ' bb-first' : ''}">
+          <span class="bb-rank">${i + 1}</span>
+          <span class="bb-result-name">${escapeHtml(e.displayName)} <span class="bb-meta">${escapeHtml(e.fileName)}</span></span>
+          <span class="bb-result-score bb-tone-${tone}">${avgRating != null ? avgRating + '/5' : '—'}</span>
+        </div>`;
       })
       .join('');
     const rematchIds = room.rematchRequestedUserIds || [];
     const rematchLine = rematchIds.length
-      ? `<div class="bb-status-line bb-meta">rematch requested (${rematchIds.length}/${(room.members || []).length}): ${escapeHtml(rematchIds.map(nameFor).join(', '))}</div>`
+      ? `<div class="bb-note bb-meta">rematch requested by ${rematchIds.length}/${(room.members || []).length}: ${escapeHtml(rematchIds.map(nameFor).join(', '))}</div>`
       : '';
-    resultsEl.innerHTML = `<div class="bb-section-title">Final results</div>${rows || '<div class="bb-empty">no scored uploads</div>'}${rematchLine}`;
+    resultsEl.innerHTML = `<div class="bb-section-title">Final results <span class="bb-count">${ranked.length}</span></div>`
+      + (rows || '<div class="bb-empty">no scored uploads</div>') + rematchLine;
   }
 
   function renderJoinedMembers() {
@@ -1830,13 +2383,14 @@
       .slice()
       .reverse()
       .map((j) => {
-        return `<div class="bb-kick-hist-entry">
-          <span class="bb-ready">${escapeHtml(j.displayName)}</span>${j.name ? ' (' + escapeHtml(j.name) + ')' : ''}
-          <div class="bb-meta">joined at ${new Date(j.joinedAt).toLocaleTimeString()}</div>
+        const tags = [];
+        return `<div class="bb-log-entry bb-log-in">
+          <span class="bb-tone-good">${escapeHtml(j.displayName)}</span>${j.name ? ` <span class="bb-meta">${escapeHtml(j.name)}</span>` : ''} ${tags.join(' ')}
+          <div class="bb-when">joined ${timeAgo(j.joinedAt)} &middot; ${new Date(j.joinedAt).toLocaleTimeString()}</div>
         </div>`;
       })
       .join('');
-    joinedMembersEl.innerHTML = `<div class="bb-section-title">Joined members (${STATE.joinedMembers.length})</div>${rows}`;
+    joinedMembersEl.innerHTML = `<div class="bb-section-title">Joined <span class="bb-count">${STATE.joinedMembers.length}</span></div>${rows}`;
   }
 
   function renderLeftMembers() {
@@ -1848,17 +2402,17 @@
       .slice()
       .reverse()
       .map((l) => {
+        const tags = [];
         const uploadNote = l.upload
-          ? `<div class="bb-meta">had uploaded: ${escapeHtml(l.upload.fileName)}</div>`
-          : '<div class="bb-meta">had not uploaded</div>';
-        return `<div class="bb-kick-hist-entry">
-          <span class="bb-kick">${escapeHtml(l.displayName)}</span>${l.name ? ' (' + escapeHtml(l.name) + ')' : ''}
-          <div class="bb-meta">${l.kicked ? 'kicked' : 'left'} at ${new Date(l.leftAt).toLocaleTimeString()}</div>
-          ${uploadNote}
+          ? `had uploaded ${escapeHtml(l.upload.fileName)}`
+          : 'had not uploaded';
+        return `<div class="bb-log-entry ${l.kicked ? 'bb-log-kick' : 'bb-log-out'}">
+          <span class="bb-tone-bad">${escapeHtml(l.displayName)}</span>${l.name ? ` <span class="bb-meta">${escapeHtml(l.name)}</span>` : ''} ${tags.join(' ')}
+          <div class="bb-when">${l.kicked ? 'kicked' : 'left'} ${timeAgo(l.leftAt)} &middot; ${escapeHtml(uploadNote)}</div>
         </div>`;
       })
       .join('');
-    leftMembersEl.innerHTML = `<div class="bb-section-title">Left members (${STATE.leftMembers.length})</div>${rows}`;
+    leftMembersEl.innerHTML = `<div class="bb-section-title">Left <span class="bb-count">${STATE.leftMembers.length}</span></div>${rows}`;
   }
 
   function buildReportText() {
@@ -1912,7 +2466,7 @@
       }
 
       const sizeKb = e.byteSize ? Math.round(e.byteSize / 1024) : '?';
-      const avgRating = formatAvgRating(e.score, e.voteCount);
+      const avgRating = formatAvgRating(e.score, e.expectedVotes);
       const score = avgRating != null ? `${avgRating}/5 (${e.voteCount} votes)` : 'no votes yet';
       const shaShort = e.sha256 ? e.sha256.slice(0, 6) : '?';
       lines.push(`${i + 1}. ${e.fileName}`);
@@ -1933,7 +2487,7 @@
         .sort((a, b) => (b.score || 0) - (a.score || 0));
       lines.push('final results:');
       ranked.forEach((e, i) => {
-        const avgRating = formatAvgRating(e.score, e.voteCount);
+        const avgRating = formatAvgRating(e.score, e.expectedVotes);
         lines.push(`  #${i + 1} ${e.displayName} - ${e.fileName} - ${avgRating != null ? `${avgRating}/5` : 'no votes'} (${e.voteCount} votes)`);
       });
       const rematchIds = room.rematchRequestedUserIds || [];

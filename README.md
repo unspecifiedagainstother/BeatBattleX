@@ -3,9 +3,7 @@
 
 A extention to improve beat-battle.net
 
-<img width="448" height="819" alt="image" src="https://github.com/user-attachments/assets/fd95214c-0a03-43e3-b742-379d717ca699" />
-<img width="368" height="697" alt="image" src="https://github.com/user-attachments/assets/265b9242-28df-4e04-8ccd-7f905e104d34" />
-<img width="758" height="250" alt="image" src="https://github.com/user-attachments/assets/fed7de1f-4f1e-44d4-a7f1-82b37ffbd266" />
+<img width="421" height="615" alt="image" src="https://github.com/user-attachments/assets/3ee3d3b7-528e-41da-a71d-ca0369195588" />
 
 ---
 
